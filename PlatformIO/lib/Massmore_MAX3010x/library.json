@@ -1,0 +1,27 @@
+{
+  "name": "Massmore_MAX3010x",
+  "version": "1.0.0",
+  "description": "ไลบรารีสำหรับเซ็นเซอร์ชีพจรและออกซิเจนในเลือดตระกูล MAX3010x (MAX30102 / MAX30101 / MAX30105) รองรับ FIFO อินเทอร์รัปต์ multi-LED อุณหภูมิแกนชิป proximity พร้อมอัลกอริทึมจับชีพจรและคำนวณ SpO2 และการตรวจสอบชิปแท้จากโรงงาน",
+  "keywords": ["sensor", "heart-rate", "pulse-oximeter", "spo2", "ppg", "max3010x", "max30102", "max30101", "max30105", "maxim", "i2c", "qwiic", "massmore"],
+  "authors": [
+    {
+      "name": "Massmore",
+      "email": "info@massmore.shop",
+      "url": "https://www.massmore.shop",
+      "maintainer": true
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Massmore/Massmore_MAX3010x_SKU-0026.git"
+  },
+  "license": "MIT",
+  "homepage": "https://www.massmore.shop",
+  "frameworks": ["arduino"],
+  "platforms": "*",
+  "headers": ["Massmore_MAX3010x.h", "Massmore_MAX3010x_Algorithms.h"],
+  "dependencies": [],
+  "export": {
+    "exclude": ["examples/**/build", "*.zip"]
+  }
+}

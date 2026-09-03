@@ -1,0 +1,10 @@
+# ระบบปฏิบัติการ
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ผลลัพธ์การ build ของ Arduino IDE
+build/
+*.hex
+*.elf
+*.map
