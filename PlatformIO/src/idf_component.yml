@@ -1,3 +1,0 @@
-## ไฟล์นี้จำเป็นสำหรับ ESP32 Arduino core 3.x ที่ build ผ่านระบบ component ของ ESP-IDF
-## ปล่อยว่างไว้แบบนี้ได้ ไม่ต้องแก้ ถ้าไม่ได้ใช้ component เพิ่มเติมจาก ESP Component Registry
-dependencies: {}

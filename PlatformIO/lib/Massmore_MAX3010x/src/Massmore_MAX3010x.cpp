@@ -1,357 +1,269 @@
-/*!
- * @file Massmore_MAX3010x.cpp
- * @brief การทำงานภายในของไลบรารี Massmore_MAX3010x
+/**
+ * @file    Massmore_MAX3010x.cpp
+ * @brief   การทำงานภายในของไลบรารี Massmore_MAX3010x
  *
  * @copyright Copyright (c) 2026 Massmore Biz Co., Ltd.
- * @license MIT
+ * @license   MIT
  */
 
 #include "Massmore_MAX3010x.h"
 
 #include <math.h>
 
-/* จำนวนไบต์สูงสุดที่ยอมอ่านต่อการทำธุรกรรม I2C หนึ่งครั้ง
-   ตั้งไว้ 30 เพราะบัฟเฟอร์ Wire ของบอร์ดเก่าบางรุ่นมีแค่ 32 ไบต์
-   และ 30 หารด้วย 3 และ 6 ลงตัว ทำให้ไม่ตัดกลางตัวอย่าง */
+/* จำนวน byte สูงสุดต่อ I2C transaction — 30 เพราะ Wire buffer ของ AVR มี 32 bytes
+   และ 30 หารด้วย 3 และ 6 ลงตัว จึงไม่ตัดกลาง sample */
 #define MAX3010X_I2C_CHUNK 30
 
+#define MAX3010X_ALGO_HIGHPASS_HZ 0.5f  /* ต่ำกว่านี้ = baseline drift ไม่ใช่ชีพจร */
+#define MAX3010X_ALGO_LOWPASS_HZ 4.0f   /* สูงกว่านี้ = noise จากไฟบ้าน / การขยับ */
+#define MAX3010X_ALGO_RMS_HZ 0.25f      /* หน้าต่าง RMS ประมาณ 4 วินาที */
+#define MAX3010X_ALGO_THRESHOLD_RISE 0.62f
+#define MAX3010X_ALGO_THRESHOLD_FALL 0.38f
+#define MAX3010X_ALGO_MIN_AMPLITUDE 25.0f
+#define MAX3010X_TWO_PI 6.28318531f
+
 /* =========================================================================
-   ตัวสร้าง
+   Constructor
    ========================================================================= */
 
-MassmoreMAX3010x::MassmoreMAX3010x()
+Massmore_MAX3010x::Massmore_MAX3010x()
     : _wire(NULL),
-      _address(MASSMORE_MAX3010X_I2C_ADDRESS),
+      _intPin(-1),
       _begun(false),
-      _timeoutMs(MASSMORE_MAX3010X_TIMEOUT_DEFAULT_MS),
-      _lastError(MASSMORE_MAX3010X_OK),
-      _variant(MASSMORE_MAX3010X_VARIANT_AUTO),
+      _timeoutMs(100),
+      _lastError(ErrorCode::NOT_BEGUN),
+      _variant(Variant::AUTO),
       _variantForced(false),
       _verifyMask(0),
-      _mode(MASSMORE_MAX3010X_MODE_SPO2),
-      _sampleAverage(MASSMORE_MAX3010X_SMP_AVE_1),
-      _sampleRate(MASSMORE_MAX3010X_RATE_50),
+      _mode(Mode::SPO2),
+      _sampleAverage(SampleAverage::X1),
+      _sampleRate(SampleRate::HZ_50),
       _activeChannels(2),
       _head(0),
       _tail(0),
-      _count(0),
-      _lastSampleMs(0) {
+      _count(0) {
   for (uint16_t i = 0; i < MASSMORE_MAX3010X_BUFFER_SIZE; i++) {
-    _bufRed[i] = 0;
-    _bufIr[i] = 0;
-    _bufGreen[i] = 0;
-    _bufMs[i] = 0;
+    _bufRed[i] = _bufIr[i] = _bufGreen[i] = _bufMs[i] = 0;
   }
 }
 
 /* =========================================================================
-   ชั้นล่างสุด คุยกับบัส I2C
+   Low-level I2C
    ========================================================================= */
 
-bool MassmoreMAX3010x::readRegister8(uint8_t reg, uint8_t &value) {
+bool Massmore_MAX3010x::readRegister8(uint8_t reg, uint8_t &value) {
   if (_wire == NULL) {
-    _lastError = MASSMORE_MAX3010X_ERR_NOT_BEGUN;
+    _lastError = ErrorCode::NOT_BEGUN;
     return false;
   }
-
-  _wire->beginTransmission(_address);
+  _wire->beginTransmission(MASSMORE_MAX3010X_I2C_ADDRESS);
   _wire->write(reg);
-  /* ใช้ endTransmission(false) ไม่ได้กับชิปตัวนี้ทุกบอร์ด จึงปิดธุรกรรมให้จบ
-     แล้วค่อยเปิดใหม่ตอนอ่าน ซึ่ง datasheet รองรับทั้งสองแบบ */
+  /* ปิด transaction แล้วเปิดใหม่ตอนอ่าน (datasheet รองรับทั้ง repeated-start และ stop) */
   if (_wire->endTransmission() != 0) {
-    _lastError = MASSMORE_MAX3010X_ERR_I2C_WRITE;
+    _lastError = ErrorCode::BUS_ERROR;
     return false;
   }
-
-  if (_wire->requestFrom((uint8_t)_address, (uint8_t)1) != 1) {
-    _lastError = MASSMORE_MAX3010X_ERR_I2C_READ;
+  if (_wire->requestFrom((uint8_t)MASSMORE_MAX3010X_I2C_ADDRESS, (uint8_t)1) != 1) {
+    _lastError = ErrorCode::BUS_ERROR;
     return false;
   }
-
   value = (uint8_t)_wire->read();
-  _lastError = MASSMORE_MAX3010X_OK;
+  _lastError = ErrorCode::OK;
   return true;
 }
 
-uint8_t MassmoreMAX3010x::readRegister8(uint8_t reg) {
+uint8_t Massmore_MAX3010x::readRegister8(uint8_t reg) {
   uint8_t value = 0;
-  if (!readRegister8(reg, value)) {
-    return 0;
-  }
+  if (!readRegister8(reg, value)) return 0;
   return value;
 }
 
-bool MassmoreMAX3010x::writeRegister8(uint8_t reg, uint8_t value) {
+bool Massmore_MAX3010x::writeRegister8(uint8_t reg, uint8_t value) {
   if (_wire == NULL) {
-    _lastError = MASSMORE_MAX3010X_ERR_NOT_BEGUN;
+    _lastError = ErrorCode::NOT_BEGUN;
     return false;
   }
-
-  _wire->beginTransmission(_address);
+  _wire->beginTransmission(MASSMORE_MAX3010X_I2C_ADDRESS);
   _wire->write(reg);
   _wire->write(value);
   if (_wire->endTransmission() != 0) {
-    _lastError = MASSMORE_MAX3010X_ERR_I2C_WRITE;
+    _lastError = ErrorCode::BUS_ERROR;
     return false;
   }
-
-  _lastError = MASSMORE_MAX3010X_OK;
+  _lastError = ErrorCode::OK;
   return true;
 }
 
-bool MassmoreMAX3010x::maskRegister8(uint8_t reg, uint8_t mask, uint8_t value) {
+bool Massmore_MAX3010x::maskRegister8(uint8_t reg, uint8_t keepMask, uint8_t value) {
   uint8_t current = 0;
-  if (!readRegister8(reg, current)) {
-    return false;
-  }
-  /* mask คือบิตที่ต้องการ "เก็บไว้" ตามแบบที่ datasheet เขียนไว้ในตาราง */
-  current = (uint8_t)((current & mask) | value);
+  if (!readRegister8(reg, current)) return false;
+  /* Read-Modify-Write: keepMask = bits ที่ต้อง "เก็บไว้" ตามตารางใน datasheet */
+  current = (uint8_t)((current & keepMask) | (value & (uint8_t)~keepMask));
   return writeRegister8(reg, current);
 }
 
-bool MassmoreMAX3010x::readRegisterBurst(uint8_t reg, uint8_t *buffer,
-                                         uint8_t length) {
+bool Massmore_MAX3010x::readRegisterBurst(uint8_t reg, uint8_t *buffer, uint8_t length) {
   if (_wire == NULL) {
-    _lastError = MASSMORE_MAX3010X_ERR_NOT_BEGUN;
+    _lastError = ErrorCode::NOT_BEGUN;
     return false;
   }
   if (buffer == NULL || length == 0) {
-    _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+    _lastError = ErrorCode::BAD_ARG;
     return false;
   }
-
-  _wire->beginTransmission(_address);
+  _wire->beginTransmission(MASSMORE_MAX3010X_I2C_ADDRESS);
   _wire->write(reg);
   if (_wire->endTransmission() != 0) {
-    _lastError = MASSMORE_MAX3010X_ERR_I2C_WRITE;
+    _lastError = ErrorCode::BUS_ERROR;
     return false;
   }
-
   uint8_t received = 0;
   while (received < length) {
     uint8_t want = (uint8_t)(length - received);
-    if (want > MAX3010X_I2C_CHUNK) {
-      want = MAX3010X_I2C_CHUNK;
-    }
-    uint8_t got = (uint8_t)_wire->requestFrom((uint8_t)_address, want);
+    if (want > MAX3010X_I2C_CHUNK) want = MAX3010X_I2C_CHUNK;
+    uint8_t got = (uint8_t)_wire->requestFrom((uint8_t)MASSMORE_MAX3010X_I2C_ADDRESS, want);
     if (got != want) {
-      _lastError = MASSMORE_MAX3010X_ERR_I2C_READ;
+      _lastError = ErrorCode::BUS_ERROR;
       return false;
     }
-    for (uint8_t i = 0; i < got; i++) {
-      buffer[received + i] = (uint8_t)_wire->read();
-    }
+    for (uint8_t i = 0; i < got; i++) buffer[received + i] = (uint8_t)_wire->read();
     received = (uint8_t)(received + got);
   }
-
-  _lastError = MASSMORE_MAX3010X_OK;
+  _lastError = ErrorCode::OK;
   return true;
 }
 
-bool MassmoreMAX3010x::waitForBit(uint8_t reg, uint8_t bitMask, bool wantSet,
-                                  uint32_t timeoutMs) {
-  uint32_t start = millis();
+bool Massmore_MAX3010x::waitForBit(uint8_t reg, uint8_t bitMask, bool wantSet, uint32_t timeoutMs) {
+  const uint32_t start = millis();
   while ((uint32_t)(millis() - start) < timeoutMs) {
     uint8_t value = 0;
-    if (!readRegister8(reg, value)) {
-      return false;
-    }
-    bool isSet = (value & bitMask) != 0;
-    if (isSet == wantSet) {
-      return true;
-    }
+    if (!readRegister8(reg, value)) return false;
+    if (((value & bitMask) != 0) == wantSet) return true;
     delay(1);
   }
-  _lastError = MASSMORE_MAX3010X_ERR_TIMEOUT;
+  _lastError = ErrorCode::TIMEOUT;
   return false;
 }
 
 /* =========================================================================
-   เริ่มต้นใช้งาน
+   begin / reset / power
    ========================================================================= */
 
-bool MassmoreMAX3010x::begin(TwoWire &wire, uint8_t address, int8_t sdaPin,
-                             int8_t sclPin, uint32_t frequency) {
-  _wire = &wire;
-  _address = address;
+bool Massmore_MAX3010x::begin(TwoWire &wirePort, int8_t intPin) {
+  _wire = &wirePort;
+  _intPin = intPin;
   _begun = false;
   _verifyMask = 0;
 
-#ifdef ARDUINO
-  if (sdaPin >= 0 && sclPin >= 0) {
-    /* ESP32 Arduino core 3.x รับพารามิเตอร์ครบสามตัวได้ในคำสั่งเดียว */
-#if defined(ESP32) || defined(ESP8266)
-    _wire->begin((int)sdaPin, (int)sclPin, frequency);
-#else
-    (void)sdaPin;
-    (void)sclPin;
-    _wire->begin();
-    _wire->setClock(frequency);
-#endif
-  } else {
-    /* ผู้ใช้เปิดบัสเองมาแล้ว เราแค่ปรับความถี่ให้ */
-    _wire->setClock(frequency);
-  }
-#else
-  (void)sdaPin;
-  (void)sclPin;
-  (void)frequency;
-#endif
-
   if (!isConnected()) {
-    _lastError = MASSMORE_MAX3010X_ERR_NO_DEVICE;
+    _lastError = ErrorCode::NOT_FOUND;
     return false;
   }
-
-  uint8_t partId = 0;
-  if (!readRegister8(MASSMORE_MAX3010X_REG_PART_ID, partId)) {
-    return false;
-  }
-  if (partId != MASSMORE_MAX3010X_PART_ID_EXPECTED) {
-    /* PART_ID 0x11 คือ MAX30100 ซึ่งใช้ตารางรีจิสเตอร์คนละชุด ไลบรารีนี้ไม่รองรับ */
-    _lastError = MASSMORE_MAX3010X_ERR_WRONG_CHIP;
-    return false;
-  }
+  if (!verifyChipID()) return false; /* lastError = WRONG_ID หรือ BUS_ERROR */
 
   _begun = true;
-
   if (!softReset()) {
     _begun = false;
     return false;
   }
-
-  if (!_variantForced) {
-    detectVariant();
-  }
+  if (!_variantForced) detectVariant();
 
   flush();
-  _lastError = MASSMORE_MAX3010X_OK;
+  _lastError = ErrorCode::OK;
   return true;
 }
 
-bool MassmoreMAX3010x::isConnected() {
+bool Massmore_MAX3010x::isConnected() {
   if (_wire == NULL) {
-    _lastError = MASSMORE_MAX3010X_ERR_NOT_BEGUN;
+    _lastError = ErrorCode::NOT_BEGUN;
     return false;
   }
-  _wire->beginTransmission(_address);
+  _wire->beginTransmission(MASSMORE_MAX3010X_I2C_ADDRESS);
   if (_wire->endTransmission() != 0) {
-    _lastError = MASSMORE_MAX3010X_ERR_NO_DEVICE;
+    _lastError = ErrorCode::NOT_FOUND;
     return false;
   }
-  _lastError = MASSMORE_MAX3010X_OK;
+  _lastError = ErrorCode::OK;
   return true;
 }
 
-bool MassmoreMAX3010x::softReset() {
-  if (!maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG,
-                     MASSMORE_MAX3010X_MASK_RESET,
+bool Massmore_MAX3010x::softReset() {
+  if (!maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, MASSMORE_MAX3010X_MASK_RESET,
                      MASSMORE_MAX3010X_BIT_RESET)) {
     return false;
   }
-  /* บิต RESET เคลียร์ตัวเองเมื่อชิปรีเซ็ตเสร็จ datasheet บอกว่าใช้เวลาไม่นาน
-     ใช้ค่าเวลารอที่ผู้ใช้ตั้งไว้ด้วย setTimeout() เผื่อบัสช้าหรือสายยาว */
-  if (!waitForBit(MASSMORE_MAX3010X_REG_MODE_CONFIG,
-                  MASSMORE_MAX3010X_BIT_RESET, false, _timeoutMs)) {
+  /* RESET bit self-clear เมื่อชิป reset เสร็จ (datasheet ไม่ระบุเวลาตายตัว จึงใช้ timeout) */
+  if (!waitForBit(MASSMORE_MAX3010X_REG_MODE_CONFIG, MASSMORE_MAX3010X_BIT_RESET, false, _timeoutMs)) {
     return false;
   }
-
-  /* ค่าภายในกลับไปเป็นค่าโรงงาน จึงต้องซิงก์สำเนาในหน่วยความจำตาม */
-  _mode = MASSMORE_MAX3010X_MODE_HR;
-  _sampleAverage = MASSMORE_MAX3010X_SMP_AVE_1;
-  _sampleRate = MASSMORE_MAX3010X_RATE_50;
+  _mode = Mode::HEART_RATE;
+  _sampleAverage = SampleAverage::X1;
+  _sampleRate = SampleRate::HZ_50;
   recomputeChannels();
   flush();
   return true;
 }
 
-bool MassmoreMAX3010x::shutdown() {
-  return maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG,
-                       MASSMORE_MAX3010X_MASK_SHUTDOWN,
+bool Massmore_MAX3010x::shutdown() {
+  return maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, MASSMORE_MAX3010X_MASK_SHUTDOWN,
                        MASSMORE_MAX3010X_BIT_SHUTDOWN);
 }
 
-bool MassmoreMAX3010x::wakeUp() {
-  return maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG,
-                       MASSMORE_MAX3010X_MASK_SHUTDOWN, 0x00);
+bool Massmore_MAX3010x::wakeUp() {
+  return maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, MASSMORE_MAX3010X_MASK_SHUTDOWN, 0x00);
 }
 
-bool MassmoreMAX3010x::setupDefault(uint8_t ledPowerLevel) {
-  /* ชุดค่าที่เหมาะกับการวางนิ้วบนเซ็นเซอร์ ผ่านการลองจริงกับบอร์ด Massmore
-     อัตราสุ่ม 400 Hz เฉลี่ย 8 ตัว จะได้ข้อมูลออกมา 50 ชุดต่อวินาที
-     ซึ่งเป็นค่าที่อัลกอริทึม SpO2 ในไลบรารีนี้ตั้งเป็นค่าปริยาย */
-  return setup(ledPowerLevel, MASSMORE_MAX3010X_SMP_AVE_8,
-               MASSMORE_MAX3010X_MODE_SPO2, MASSMORE_MAX3010X_RATE_400,
-               MASSMORE_MAX3010X_PULSE_411US,
-               MASSMORE_MAX3010X_ADC_RANGE_4096);
+bool Massmore_MAX3010x::setupDefault(uint8_t ledPower) {
+  return setup(ledPower, SampleAverage::X8, Mode::SPO2, SampleRate::HZ_400, PulseWidth::US_411,
+               AdcRange::NA_4096);
 }
 
-bool MassmoreMAX3010x::setup(uint8_t ledPowerLevel,
-                             massmore_max3010x_smp_ave_t sampleAverage,
-                             massmore_max3010x_mode_t mode,
-                             massmore_max3010x_rate_t sampleRate,
-                             massmore_max3010x_pulse_width_t pulseWidth,
-                             massmore_max3010x_adc_range_t adcRange) {
+bool Massmore_MAX3010x::setup(uint8_t ledPower, SampleAverage average, Mode mode, SampleRate rate,
+                              PulseWidth width, AdcRange range) {
   if (!_begun) {
-    _lastError = MASSMORE_MAX3010X_ERR_NOT_BEGUN;
+    _lastError = ErrorCode::NOT_BEGUN;
     return false;
   }
+  bool ok = softReset();
+  ok = ok && setFifoAlmostFull(15);
+  ok = ok && setFifoRollover(true);
+  ok = ok && setSampleAverage(average);
+  ok = ok && setAdcRange(range);
+  ok = ok && setSampleRate(rate);
+  ok = ok && setPulseWidth(width);
+  ok = ok && setPulseAmplitudeRed(ledPower);
+  ok = ok && setPulseAmplitudeIR(ledPower);
+  if (hasGreenLed()) ok = ok && setPulseAmplitudeGreen(mode == Mode::MULTI_LED ? ledPower : 0);
+  if (hasProximity()) ok = ok && setPulseAmplitudeProximity(ledPower);
 
-  bool ok = true;
-  ok = ok && softReset();
-  ok = ok && setFifoAlmostFull(15);   /* แจ้งเตือนตั้งแต่ FIFO มี 17 ตัวอย่าง */
-  ok = ok && setFifoRollover(true);   /* ยอมให้ข้อมูลเก่าถูกทับ ดีกว่าค้าง */
-  ok = ok && setSampleAverage(sampleAverage);
-  ok = ok && setAdcRange(adcRange);
-  ok = ok && setSampleRate(sampleRate);
-  ok = ok && setPulseWidth(pulseWidth);
-
-  ok = ok && setPulseAmplitudeRed(ledPowerLevel);
-  ok = ok && setPulseAmplitudeIR(ledPowerLevel);
-  if (hasGreenLed()) {
-    ok = ok && setPulseAmplitudeGreen(
-                   mode == MASSMORE_MAX3010X_MODE_MULTI_LED ? ledPowerLevel : 0);
+  if (mode == Mode::MULTI_LED) {
+    ok = ok && setMultiLedSlot(1, Slot::RED);
+    ok = ok && setMultiLedSlot(2, Slot::IR);
+    ok = ok && setMultiLedSlot(3, hasGreenLed() ? Slot::GREEN : Slot::NONE);
+    ok = ok && setMultiLedSlot(4, Slot::NONE);
   }
-  if (hasProximity()) {
-    ok = ok && setPulseAmplitudeProximity(ledPowerLevel);
-  }
-
-  /* ตั้งช่องเวลาให้สอดคล้องกับโหมด เผื่อผู้ใช้เลือก multi-LED */
-  if (mode == MASSMORE_MAX3010X_MODE_MULTI_LED) {
-    ok = ok && setMultiLedSlot(1, MASSMORE_MAX3010X_SLOT_RED);
-    ok = ok && setMultiLedSlot(2, MASSMORE_MAX3010X_SLOT_IR);
-    ok = ok && setMultiLedSlot(3, hasGreenLed() ? MASSMORE_MAX3010X_SLOT_GREEN
-                                                : MASSMORE_MAX3010X_SLOT_NONE);
-    ok = ok && setMultiLedSlot(4, MASSMORE_MAX3010X_SLOT_NONE);
-  }
-
-  /* ตั้งโหมดเป็นขั้นสุดท้าย เพราะชิปเริ่มยิง LED ทันทีที่ตั้งโหมด */
+  /* ตั้ง mode เป็นขั้นสุดท้าย เพราะชิปเริ่มยิง LED ทันทีที่ตั้ง */
   ok = ok && setMode(mode);
   ok = ok && clearFifo();
-
   flush();
   return ok;
 }
 
 /* =========================================================================
-   การตั้งค่าแต่ละหัวข้อ
+   Configuration
    ========================================================================= */
 
-void MassmoreMAX3010x::recomputeChannels() {
+void Massmore_MAX3010x::recomputeChannels() {
   switch (_mode) {
-    case MASSMORE_MAX3010X_MODE_HR:
+    case Mode::HEART_RATE:
       _activeChannels = 1;
       break;
-    case MASSMORE_MAX3010X_MODE_SPO2:
+    case Mode::SPO2:
       _activeChannels = 2;
       break;
-    case MASSMORE_MAX3010X_MODE_MULTI_LED:
     default: {
-      /* ในโหมด multi-LED จำนวนช่องข้อมูลเท่ากับจำนวนช่องเวลาที่ไม่ได้ปิดไว้
-         ต้องอ่านกลับจากชิปเพราะผู้ใช้ตั้งเองได้อิสระ */
-      uint8_t slots = 0;
-      uint8_t reg1 = 0;
-      uint8_t reg2 = 0;
+      /* Multi-LED: จำนวน channel = จำนวน slot ที่ไม่ใช่ NONE ต้องอ่านจากชิป */
+      uint8_t slots = 0, reg1 = 0, reg2 = 0;
       if (readRegister8(MASSMORE_MAX3010X_REG_MULTI_LED_1, reg1) &&
           readRegister8(MASSMORE_MAX3010X_REG_MULTI_LED_2, reg2)) {
         if ((reg1 & 0x07) != 0) slots++;
@@ -365,39 +277,29 @@ void MassmoreMAX3010x::recomputeChannels() {
   }
 }
 
-bool MassmoreMAX3010x::setMode(massmore_max3010x_mode_t mode) {
+bool Massmore_MAX3010x::setMode(Mode mode) {
   uint8_t value;
   switch (mode) {
-    case MASSMORE_MAX3010X_MODE_HR:
-      value = MASSMORE_MAX3010X_MODE_VAL_HR;
-      break;
-    case MASSMORE_MAX3010X_MODE_SPO2:
-      value = MASSMORE_MAX3010X_MODE_VAL_SPO2;
-      break;
-    case MASSMORE_MAX3010X_MODE_MULTI_LED:
-      value = MASSMORE_MAX3010X_MODE_VAL_MULTI_LED;
-      break;
+    case Mode::HEART_RATE: value = MASSMORE_MAX3010X_MODE_VAL_HR; break;
+    case Mode::SPO2: value = MASSMORE_MAX3010X_MODE_VAL_SPO2; break;
+    case Mode::MULTI_LED: value = MASSMORE_MAX3010X_MODE_VAL_MULTI_LED; break;
     default:
-      _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+      _lastError = ErrorCode::BAD_ARG;
       return false;
   }
-  if (!maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG,
-                     MASSMORE_MAX3010X_MASK_MODE, value)) {
-    return false;
-  }
+  if (!maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, MASSMORE_MAX3010X_MASK_MODE, value)) return false;
   _mode = mode;
   recomputeChannels();
   flush();
   return true;
 }
 
-bool MassmoreMAX3010x::setSampleAverage(massmore_max3010x_smp_ave_t average) {
-  if ((uint8_t)average > (uint8_t)MASSMORE_MAX3010X_SMP_AVE_32) {
-    _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+bool Massmore_MAX3010x::setSampleAverage(SampleAverage average) {
+  if ((uint8_t)average > (uint8_t)SampleAverage::X32) {
+    _lastError = ErrorCode::BAD_ARG;
     return false;
   }
-  if (!maskRegister8(MASSMORE_MAX3010X_REG_FIFO_CONFIG,
-                     MASSMORE_MAX3010X_MASK_SMP_AVE,
+  if (!maskRegister8(MASSMORE_MAX3010X_REG_FIFO_CONFIG, MASSMORE_MAX3010X_MASK_SMP_AVE,
                      (uint8_t)((uint8_t)average << 5))) {
     return false;
   }
@@ -405,38 +307,34 @@ bool MassmoreMAX3010x::setSampleAverage(massmore_max3010x_smp_ave_t average) {
   return true;
 }
 
-bool MassmoreMAX3010x::setFifoRollover(bool enable) {
-  return maskRegister8(MASSMORE_MAX3010X_REG_FIFO_CONFIG,
-                       MASSMORE_MAX3010X_MASK_ROLLOVER,
+bool Massmore_MAX3010x::setFifoRollover(bool enable) {
+  return maskRegister8(MASSMORE_MAX3010X_REG_FIFO_CONFIG, MASSMORE_MAX3010X_MASK_ROLLOVER,
                        enable ? MASSMORE_MAX3010X_BIT_ROLLOVER_EN : 0x00);
 }
 
-bool MassmoreMAX3010x::setFifoAlmostFull(uint8_t spacesLeft) {
+bool Massmore_MAX3010x::setFifoAlmostFull(uint8_t spacesLeft) {
   if (spacesLeft > 15) {
-    _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+    _lastError = ErrorCode::BAD_ARG;
     return false;
   }
-  return maskRegister8(MASSMORE_MAX3010X_REG_FIFO_CONFIG,
-                       MASSMORE_MAX3010X_MASK_A_FULL, spacesLeft);
+  return maskRegister8(MASSMORE_MAX3010X_REG_FIFO_CONFIG, MASSMORE_MAX3010X_MASK_A_FULL, spacesLeft);
 }
 
-bool MassmoreMAX3010x::setAdcRange(massmore_max3010x_adc_range_t range) {
-  if ((uint8_t)range > (uint8_t)MASSMORE_MAX3010X_ADC_RANGE_16384) {
-    _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+bool Massmore_MAX3010x::setAdcRange(AdcRange range) {
+  if ((uint8_t)range > (uint8_t)AdcRange::NA_16384) {
+    _lastError = ErrorCode::BAD_ARG;
     return false;
   }
-  return maskRegister8(MASSMORE_MAX3010X_REG_SPO2_CONFIG,
-                       MASSMORE_MAX3010X_MASK_ADC_RANGE,
+  return maskRegister8(MASSMORE_MAX3010X_REG_SPO2_CONFIG, MASSMORE_MAX3010X_MASK_ADC_RANGE,
                        (uint8_t)((uint8_t)range << 5));
 }
 
-bool MassmoreMAX3010x::setSampleRate(massmore_max3010x_rate_t rate) {
-  if ((uint8_t)rate > (uint8_t)MASSMORE_MAX3010X_RATE_3200) {
-    _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+bool Massmore_MAX3010x::setSampleRate(SampleRate rate) {
+  if ((uint8_t)rate > (uint8_t)SampleRate::HZ_3200) {
+    _lastError = ErrorCode::BAD_ARG;
     return false;
   }
-  if (!maskRegister8(MASSMORE_MAX3010X_REG_SPO2_CONFIG,
-                     MASSMORE_MAX3010X_MASK_SAMPLE_RATE,
+  if (!maskRegister8(MASSMORE_MAX3010X_REG_SPO2_CONFIG, MASSMORE_MAX3010X_MASK_SAMPLE_RATE,
                      (uint8_t)((uint8_t)rate << 2))) {
     return false;
   }
@@ -444,580 +342,391 @@ bool MassmoreMAX3010x::setSampleRate(massmore_max3010x_rate_t rate) {
   return true;
 }
 
-bool MassmoreMAX3010x::setPulseWidth(massmore_max3010x_pulse_width_t width) {
-  if ((uint8_t)width > (uint8_t)MASSMORE_MAX3010X_PULSE_411US) {
-    _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+bool Massmore_MAX3010x::setPulseWidth(PulseWidth width) {
+  if ((uint8_t)width > (uint8_t)PulseWidth::US_411) {
+    _lastError = ErrorCode::BAD_ARG;
     return false;
   }
-  return maskRegister8(MASSMORE_MAX3010X_REG_SPO2_CONFIG,
-                       MASSMORE_MAX3010X_MASK_PULSE_WIDTH, (uint8_t)width);
+  return maskRegister8(MASSMORE_MAX3010X_REG_SPO2_CONFIG, MASSMORE_MAX3010X_MASK_PULSE_WIDTH, (uint8_t)width);
 }
 
-bool MassmoreMAX3010x::setPulseAmplitudeRed(uint8_t value) {
+bool Massmore_MAX3010x::setPulseAmplitudeRed(uint8_t value) {
   return writeRegister8(MASSMORE_MAX3010X_REG_LED1_PA, value);
 }
-
-bool MassmoreMAX3010x::setPulseAmplitudeIR(uint8_t value) {
+bool Massmore_MAX3010x::setPulseAmplitudeIR(uint8_t value) {
   return writeRegister8(MASSMORE_MAX3010X_REG_LED2_PA, value);
 }
-
-bool MassmoreMAX3010x::setPulseAmplitudeGreen(uint8_t value) {
+bool Massmore_MAX3010x::setPulseAmplitudeGreen(uint8_t value) {
   if (!hasGreenLed()) {
-    _lastError = MASSMORE_MAX3010X_ERR_UNSUPPORTED;
+    _lastError = ErrorCode::UNSUPPORTED;
     return false;
   }
   return writeRegister8(MASSMORE_MAX3010X_REG_LED3_PA, value);
 }
-
-bool MassmoreMAX3010x::setPulseAmplitudeProximity(uint8_t value) {
-  /* MAX30102 และ MAX30101 ไม่มีรีจิสเตอร์ PILOT_PA การเขียนลงไปจึงไม่มีผล
-     แจ้งกลับเป็นข้อผิดพลาดดีกว่าปล่อยให้ผู้ใช้เข้าใจผิดว่าตั้งค่าสำเร็จ */
+bool Massmore_MAX3010x::setPulseAmplitudeProximity(uint8_t value) {
   if (!hasProximity()) {
-    _lastError = MASSMORE_MAX3010X_ERR_UNSUPPORTED;
+    _lastError = ErrorCode::UNSUPPORTED;
     return false;
   }
   return writeRegister8(MASSMORE_MAX3010X_REG_PILOT_PA, value);
 }
 
-bool MassmoreMAX3010x::setAllLedsOff() {
-  bool ok = true;
-  ok = ok && setPulseAmplitudeRed(0);
+bool Massmore_MAX3010x::setAllLedsOff() {
+  bool ok = setPulseAmplitudeRed(0);
   ok = ok && setPulseAmplitudeIR(0);
-  if (hasGreenLed()) {
-    ok = ok && setPulseAmplitudeGreen(0);
-  }
-  if (hasProximity()) {
-    ok = ok && setPulseAmplitudeProximity(0);
-  }
+  if (hasGreenLed()) ok = ok && setPulseAmplitudeGreen(0);
+  if (hasProximity()) ok = ok && setPulseAmplitudeProximity(0);
   return ok;
 }
 
-bool MassmoreMAX3010x::setMultiLedSlot(uint8_t slotNumber,
-                                       massmore_max3010x_slot_t device) {
-  if (slotNumber < 1 || slotNumber > 4) {
-    _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+bool Massmore_MAX3010x::setMultiLedSlot(uint8_t slotNumber, Slot device) {
+  if (slotNumber < 1 || slotNumber > 4 || (uint8_t)device > 7) {
+    _lastError = ErrorCode::BAD_ARG;
     return false;
   }
-  if ((uint8_t)device > 7) {
-    _lastError = MASSMORE_MAX3010X_ERR_BAD_ARG;
+  if ((device == Slot::GREEN || device == Slot::GREEN_PILOT) && !hasGreenLed()) {
+    _lastError = ErrorCode::UNSUPPORTED;
     return false;
   }
-  if ((device == MASSMORE_MAX3010X_SLOT_GREEN ||
-       device == MASSMORE_MAX3010X_SLOT_GREEN_PILOT) &&
-      !hasGreenLed()) {
-    _lastError = MASSMORE_MAX3010X_ERR_UNSUPPORTED;
-    return false;
-  }
-
-  uint8_t reg = (slotNumber <= 2) ? MASSMORE_MAX3010X_REG_MULTI_LED_1
-                                  : MASSMORE_MAX3010X_REG_MULTI_LED_2;
-  bool isOddSlot = (slotNumber == 1 || slotNumber == 3);
-
-  bool ok;
-  if (isOddSlot) {
-    ok = maskRegister8(reg, MASSMORE_MAX3010X_MASK_SLOT_ODD, (uint8_t)device);
-  } else {
-    ok = maskRegister8(reg, MASSMORE_MAX3010X_MASK_SLOT_EVEN,
-                       (uint8_t)((uint8_t)device << 4));
-  }
-  if (!ok) {
-    return false;
-  }
-  if (_mode == MASSMORE_MAX3010X_MODE_MULTI_LED) {
+  const uint8_t reg = (slotNumber <= 2) ? MASSMORE_MAX3010X_REG_MULTI_LED_1 : MASSMORE_MAX3010X_REG_MULTI_LED_2;
+  const bool odd = (slotNumber == 1 || slotNumber == 3);
+  bool ok = odd ? maskRegister8(reg, MASSMORE_MAX3010X_MASK_SLOT_ODD, (uint8_t)device)
+                : maskRegister8(reg, MASSMORE_MAX3010X_MASK_SLOT_EVEN, (uint8_t)((uint8_t)device << 4));
+  if (!ok) return false;
+  if (_mode == Mode::MULTI_LED) {
     recomputeChannels();
     flush();
   }
   return true;
 }
 
-bool MassmoreMAX3010x::setProximityThreshold(uint8_t threshold) {
+bool Massmore_MAX3010x::setProximityThreshold(uint8_t threshold) {
   if (!hasProximity()) {
-    _lastError = MASSMORE_MAX3010X_ERR_UNSUPPORTED;
+    _lastError = ErrorCode::UNSUPPORTED;
     return false;
   }
   return writeRegister8(MASSMORE_MAX3010X_REG_PROX_INT_THRESH, threshold);
 }
 
 /* =========================================================================
-   อินเทอร์รัปต์
+   Interrupts
    ========================================================================= */
 
-uint8_t MassmoreMAX3010x::getInterruptStatus1() {
-  return readRegister8(MASSMORE_MAX3010X_REG_INT_STATUS_1);
-}
-
-uint8_t MassmoreMAX3010x::getInterruptStatus2() {
-  return readRegister8(MASSMORE_MAX3010X_REG_INT_STATUS_2);
-}
-
-bool MassmoreMAX3010x::enableInterruptAlmostFull(bool enable) {
-  return maskRegister8(MASSMORE_MAX3010X_REG_INT_ENABLE_1,
-                       (uint8_t)~MASSMORE_MAX3010X_INT_A_FULL,
-                       enable ? MASSMORE_MAX3010X_INT_A_FULL : 0);
-}
-
-bool MassmoreMAX3010x::enableInterruptDataReady(bool enable) {
-  return maskRegister8(MASSMORE_MAX3010X_REG_INT_ENABLE_1,
-                       (uint8_t)~MASSMORE_MAX3010X_INT_PPG_RDY,
-                       enable ? MASSMORE_MAX3010X_INT_PPG_RDY : 0);
-}
-
-bool MassmoreMAX3010x::enableInterruptAmbientLightOverflow(bool enable) {
-  return maskRegister8(MASSMORE_MAX3010X_REG_INT_ENABLE_1,
-                       (uint8_t)~MASSMORE_MAX3010X_INT_ALC_OVF,
-                       enable ? MASSMORE_MAX3010X_INT_ALC_OVF : 0);
-}
-
-bool MassmoreMAX3010x::enableInterruptProximity(bool enable) {
-  if (!hasProximity()) {
-    _lastError = MASSMORE_MAX3010X_ERR_UNSUPPORTED;
-    return false;
+bool Massmore_MAX3010x::enableInterrupt(InterruptSource source, bool enable) {
+  uint8_t reg = MASSMORE_MAX3010X_REG_INT_ENABLE_1;
+  uint8_t bit;
+  switch (source) {
+    case InterruptSource::ALMOST_FULL: bit = MASSMORE_MAX3010X_INT_A_FULL; break;
+    case InterruptSource::DATA_READY: bit = MASSMORE_MAX3010X_INT_PPG_RDY; break;
+    case InterruptSource::AMBIENT_OVERFLOW: bit = MASSMORE_MAX3010X_INT_ALC_OVF; break;
+    case InterruptSource::PROXIMITY:
+      if (!hasProximity()) {
+        _lastError = ErrorCode::UNSUPPORTED;
+        return false;
+      }
+      bit = MASSMORE_MAX3010X_INT_PROX;
+      break;
+    case InterruptSource::DIE_TEMP_READY:
+      reg = MASSMORE_MAX3010X_REG_INT_ENABLE_2;
+      bit = MASSMORE_MAX3010X_INT_DIE_TEMP_RDY;
+      break;
+    default:
+      _lastError = ErrorCode::BAD_ARG;
+      return false;
   }
-  return maskRegister8(MASSMORE_MAX3010X_REG_INT_ENABLE_1,
-                       (uint8_t)~MASSMORE_MAX3010X_INT_PROX,
-                       enable ? MASSMORE_MAX3010X_INT_PROX : 0);
+  return maskRegister8(reg, (uint8_t)~bit, enable ? bit : 0);
 }
 
-bool MassmoreMAX3010x::enableInterruptDieTemperature(bool enable) {
-  return maskRegister8(MASSMORE_MAX3010X_REG_INT_ENABLE_2,
-                       (uint8_t)~MASSMORE_MAX3010X_INT_DIE_TEMP_RDY,
-                       enable ? MASSMORE_MAX3010X_INT_DIE_TEMP_RDY : 0);
-}
-
-bool MassmoreMAX3010x::disableAllInterrupts() {
+bool Massmore_MAX3010x::disableAllInterrupts() {
   bool ok = writeRegister8(MASSMORE_MAX3010X_REG_INT_ENABLE_1, 0x00);
   ok = writeRegister8(MASSMORE_MAX3010X_REG_INT_ENABLE_2, 0x00) && ok;
   return ok;
 }
 
+uint8_t Massmore_MAX3010x::getInterruptStatus1() { return readRegister8(MASSMORE_MAX3010X_REG_INT_STATUS_1); }
+uint8_t Massmore_MAX3010x::getInterruptStatus2() { return readRegister8(MASSMORE_MAX3010X_REG_INT_STATUS_2); }
+
 /* =========================================================================
    FIFO
    ========================================================================= */
 
-bool MassmoreMAX3010x::clearFifo() {
-  bool ok = true;
-  ok = writeRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, 0x00) && ok;
+bool Massmore_MAX3010x::clearFifo() {
+  bool ok = writeRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, 0x00);
   ok = writeRegister8(MASSMORE_MAX3010X_REG_OVF_COUNTER, 0x00) && ok;
   ok = writeRegister8(MASSMORE_MAX3010X_REG_FIFO_RD_PTR, 0x00) && ok;
   flush();
   return ok;
 }
 
-uint8_t MassmoreMAX3010x::getWritePointer() {
-  return (uint8_t)(readRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR) & 0x1F);
-}
+uint8_t Massmore_MAX3010x::getWritePointer() { return (uint8_t)(readRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR) & 0x1F); }
+uint8_t Massmore_MAX3010x::getReadPointer() { return (uint8_t)(readRegister8(MASSMORE_MAX3010X_REG_FIFO_RD_PTR) & 0x1F); }
+uint8_t Massmore_MAX3010x::getOverflowCounter() { return (uint8_t)(readRegister8(MASSMORE_MAX3010X_REG_OVF_COUNTER) & 0x1F); }
 
-uint8_t MassmoreMAX3010x::getReadPointer() {
-  return (uint8_t)(readRegister8(MASSMORE_MAX3010X_REG_FIFO_RD_PTR) & 0x1F);
-}
-
-uint8_t MassmoreMAX3010x::getOverflowCounter() {
-  return (uint8_t)(readRegister8(MASSMORE_MAX3010X_REG_OVF_COUNTER) & 0x1F);
-}
-
-uint8_t MassmoreMAX3010x::getSamplesInFifo() {
-  uint8_t writePtr = 0;
-  uint8_t readPtr = 0;
-  if (!readRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, writePtr)) {
-    return 0;
-  }
-  if (!readRegister8(MASSMORE_MAX3010X_REG_FIFO_RD_PTR, readPtr)) {
-    return 0;
-  }
+uint8_t Massmore_MAX3010x::getSamplesInFifo() {
+  uint8_t writePtr = 0, readPtr = 0;
+  if (!readRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, writePtr)) return 0;
+  if (!readRegister8(MASSMORE_MAX3010X_REG_FIFO_RD_PTR, readPtr)) return 0;
   writePtr &= 0x1F;
   readPtr &= 0x1F;
-
   int16_t pending = (int16_t)writePtr - (int16_t)readPtr;
-  if (pending < 0) {
-    /* ตัวชี้วนกลับไปต้นแถวแล้ว บวกความลึกของ FIFO คืนให้ */
-    pending += MASSMORE_MAX3010X_FIFO_DEPTH;
-  }
-
+  if (pending < 0) pending += MASSMORE_MAX3010X_FIFO_DEPTH;
   if (pending == 0) {
-    /* ตัวชี้ทั้งสองชี้ที่เดียวกันได้สองกรณี คือ "ว่างสนิท" กับ "เต็มพอดี 32 ตัว"
-       แยกสองกรณีนี้ด้วยตัวนับ overflow ซึ่งจะเดินขึ้นเฉพาะตอนที่ FIFO เต็มแล้ว
-       ถ้าไม่แยก ข้อมูลเต็ม FIFO จะถูกมองข้ามไปทั้งชุดเมื่อ loop() ช้ากว่าปกติ */
+    /* pointer เท่ากันได้ทั้ง "ว่าง" และ "เต็ม 32" — แยกด้วย overflow counter */
     uint8_t overflow = 0;
-    if (readRegister8(MASSMORE_MAX3010X_REG_OVF_COUNTER, overflow) &&
-        (overflow & 0x1F) != 0) {
+    if (readRegister8(MASSMORE_MAX3010X_REG_OVF_COUNTER, overflow) && (overflow & 0x1F) != 0) {
       return MASSMORE_MAX3010X_FIFO_DEPTH;
     }
   }
-
   return (uint8_t)pending;
 }
 
-void MassmoreMAX3010x::pushSample(uint32_t red, uint32_t ir, uint32_t green) {
-  const uint32_t now = millis();
-
+void Massmore_MAX3010x::pushSample(uint32_t red, uint32_t ir, uint32_t green) {
   _bufRed[_head] = red;
   _bufIr[_head] = ir;
   _bufGreen[_head] = green;
-  /* เก็บเวลาแยกรายตัวอย่าง ไม่ใช่เก็บตัวเดียวรวม เพราะผู้ใช้อาจทยอยอ่าน
-     ข้ามหลายรอบของ loop() แล้วเวลาที่ติดมากับตัวอย่างเก่าจะเพี้ยน */
-  _bufMs[_head] = now;
-
+  _bufMs[_head] = millis();
   _head = (uint8_t)((_head + 1) % MASSMORE_MAX3010X_BUFFER_SIZE);
   if (_count < MASSMORE_MAX3010X_BUFFER_SIZE) {
     _count++;
   } else {
-    /* บัฟเฟอร์เต็ม ตัวเก่าสุดถูกทับ จึงต้องเลื่อนหางตาม */
-    _tail = (uint8_t)((_tail + 1) % MASSMORE_MAX3010X_BUFFER_SIZE);
+    _tail = (uint8_t)((_tail + 1) % MASSMORE_MAX3010X_BUFFER_SIZE); /* ทับตัวเก่าสุด */
   }
-  _lastSampleMs = now;
 }
 
-bool MassmoreMAX3010x::update() {
+bool Massmore_MAX3010x::requestConversion() {
   if (!_begun) {
-    _lastError = MASSMORE_MAX3010X_ERR_NOT_BEGUN;
+    _lastError = ErrorCode::NOT_BEGUN;
     return false;
   }
+  return clearFifo();
+}
 
-  uint8_t pending = getSamplesInFifo();
+bool Massmore_MAX3010x::update() {
+  if (!_begun) {
+    _lastError = ErrorCode::NOT_BEGUN;
+    return false;
+  }
+  const uint8_t pending = getSamplesInFifo();
   if (pending == 0) {
-    _lastError = MASSMORE_MAX3010X_ERR_NO_DATA;
+    _lastError = ErrorCode::NOT_READY;
     return false;
   }
-
-  const uint8_t bytesPerSample =
-      (uint8_t)(_activeChannels * MASSMORE_MAX3010X_BYTES_PER_CHANNEL);
-
-  /* อ่านทีละก้อน โดยให้ขนาดก้อนหารด้วยขนาดตัวอย่างลงตัวเสมอ
-     จะได้ไม่มีตัวอย่างไหนถูกตัดครึ่งคาบัส */
+  const uint8_t bytesPerSample = (uint8_t)(_activeChannels * MASSMORE_MAX3010X_BYTES_PER_CHANNEL);
   uint8_t samplesPerChunk = (uint8_t)(MAX3010X_I2C_CHUNK / bytesPerSample);
-  if (samplesPerChunk == 0) {
-    samplesPerChunk = 1;
-  }
+  if (samplesPerChunk == 0) samplesPerChunk = 1;
 
   uint8_t buffer[MAX3010X_I2C_CHUNK];
   uint8_t fetched = 0;
-
-  /* ตั้งตัวชี้รีจิสเตอร์ไปที่ FIFO_DATA หนึ่งครั้ง จากนั้นชิปจะป้อนข้อมูล
-     ต่อเนื่องเองโดยไม่ขยับตัวชี้รีจิสเตอร์ (ตามที่ datasheet ระบุไว้) */
   while (fetched < pending) {
     uint8_t want = (uint8_t)(pending - fetched);
-    if (want > samplesPerChunk) {
-      want = samplesPerChunk;
-    }
-    uint8_t bytes = (uint8_t)(want * bytesPerSample);
-
-    if (!readRegisterBurst(MASSMORE_MAX3010X_REG_FIFO_DATA, buffer, bytes)) {
-      return fetched > 0;
-    }
+    if (want > samplesPerChunk) want = samplesPerChunk;
+    const uint8_t bytes = (uint8_t)(want * bytesPerSample);
+    if (!readRegisterBurst(MASSMORE_MAX3010X_REG_FIFO_DATA, buffer, bytes)) return fetched > 0;
 
     for (uint8_t s = 0; s < want; s++) {
       const uint8_t *p = &buffer[s * bytesPerSample];
       uint32_t channel[4] = {0, 0, 0, 0};
-
       for (uint8_t c = 0; c < _activeChannels && c < 4; c++) {
-        uint32_t value = ((uint32_t)p[c * 3] << 16) |
-                         ((uint32_t)p[c * 3 + 1] << 8) |
-                         (uint32_t)p[c * 3 + 2];
-        /* ข้อมูลเป็นเลข 18 บิตชิดซ้ายในกรอบ 24 บิต จึงต้องมาสก์ 6 บิตบนทิ้ง */
-        channel[c] = value & MASSMORE_MAX3010X_DATA_MASK;
+        uint32_t v = ((uint32_t)p[c * 3] << 16) | ((uint32_t)p[c * 3 + 1] << 8) | (uint32_t)p[c * 3 + 2];
+        channel[c] = v & MASSMORE_MAX3010X_DATA_MASK; /* 18-bit ในกรอบ 24-bit */
       }
-
-      /* จัดช่องข้อมูลให้ตรงกับความหมายของแต่ละโหมด */
       switch (_mode) {
-        case MASSMORE_MAX3010X_MODE_HR:
-          /* โหมดนี้ชิปยิง LED1 ดวงเดียว ซึ่งบน MAX30102 คือสีแดง */
-          pushSample(channel[0], 0, 0);
-          break;
-        case MASSMORE_MAX3010X_MODE_SPO2:
-          pushSample(channel[0], channel[1], 0);
-          break;
-        case MASSMORE_MAX3010X_MODE_MULTI_LED:
-        default:
-          /* ค่าปริยายของ setup() คือ slot1=แดง slot2=IR slot3=เขียว */
-          pushSample(channel[0], channel[1], channel[2]);
-          break;
+        case Mode::HEART_RATE: pushSample(channel[0], 0, 0); break;
+        case Mode::SPO2: pushSample(channel[0], channel[1], 0); break;
+        default: pushSample(channel[0], channel[1], channel[2]); break;
       }
     }
     fetched = (uint8_t)(fetched + want);
   }
-
   if (pending >= MASSMORE_MAX3010X_FIFO_DEPTH) {
-    /* เพิ่งกวาดข้อมูลชุดที่ FIFO ล้นออกมาหมดแล้ว ต้องล้างตัวนับ overflow ด้วย
-       ไม่งั้นรอบถัดไปที่ FIFO ว่างจริงจะถูกเข้าใจผิดว่าเต็มอีกครั้ง */
+    /* กวาดข้อมูลที่ล้นออกหมดแล้ว ต้องล้าง overflow counter ด้วย */
     writeRegister8(MASSMORE_MAX3010X_REG_OVF_COUNTER, 0x00);
   }
-
-  _lastError = MASSMORE_MAX3010X_OK;
+  _lastError = ErrorCode::OK;
   return true;
 }
 
-uint8_t MassmoreMAX3010x::available() const { return _count; }
-
-void MassmoreMAX3010x::nextSample() {
+bool Massmore_MAX3010x::getReadings(Readings &out) {
   if (_count == 0) {
-    return;
-  }
-  _tail = (uint8_t)((_tail + 1) % MASSMORE_MAX3010X_BUFFER_SIZE);
-  _count--;
-}
-
-uint32_t MassmoreMAX3010x::getRed() const {
-  return (_count == 0) ? 0 : _bufRed[_tail];
-}
-
-uint32_t MassmoreMAX3010x::getIR() const {
-  return (_count == 0) ? 0 : _bufIr[_tail];
-}
-
-uint32_t MassmoreMAX3010x::getGreen() const {
-  return (_count == 0) ? 0 : _bufGreen[_tail];
-}
-
-bool MassmoreMAX3010x::peekSample(massmore_max3010x_sample_t &out) const {
-  if (_count == 0) {
+    _lastError = ErrorCode::NOT_READY;
     return false;
   }
   out.red = _bufRed[_tail];
   out.ir = _bufIr[_tail];
   out.green = _bufGreen[_tail];
   out.timestampMs = _bufMs[_tail];
+  nextSample();
+  _lastError = ErrorCode::OK;
   return true;
 }
 
-bool MassmoreMAX3010x::readSample(massmore_max3010x_sample_t &out,
-                                  uint32_t timeoutMs) {
-  uint32_t start = millis();
+void Massmore_MAX3010x::nextSample() {
+  if (_count == 0) return;
+  _tail = (uint8_t)((_tail + 1) % MASSMORE_MAX3010X_BUFFER_SIZE);
+  _count--;
+}
+
+void Massmore_MAX3010x::flush() {
+  _head = _tail = _count = 0;
+}
+
+bool Massmore_MAX3010x::readAll(Readings &out, uint32_t timeoutMs) {
+  if (!_begun) {
+    _lastError = ErrorCode::NOT_BEGUN;
+    return false;
+  }
+  const uint32_t start = millis();
   do {
     if (_count > 0 || update()) {
-      if (peekSample(out)) {
-        nextSample();
-        return true;
-      }
+      if (getReadings(out)) return true;
     }
     delay(1);
   } while ((uint32_t)(millis() - start) < timeoutMs);
-
-  _lastError = MASSMORE_MAX3010X_ERR_TIMEOUT;
+  _lastError = ErrorCode::TIMEOUT;
   return false;
-}
-
-void MassmoreMAX3010x::flush() {
-  _head = 0;
-  _tail = 0;
-  _count = 0;
-  _lastSampleMs = 0;
 }
 
 /* =========================================================================
-   อุณหภูมิแกนชิป
+   Die temperature
    ========================================================================= */
 
-bool MassmoreMAX3010x::startTemperatureConversion() {
-  return writeRegister8(MASSMORE_MAX3010X_REG_DIE_TEMP_CONFIG,
-                        MASSMORE_MAX3010X_BIT_TEMP_EN);
+bool Massmore_MAX3010x::startTemperatureConversion() {
+  return writeRegister8(MASSMORE_MAX3010X_REG_DIE_TEMP_CONFIG, MASSMORE_MAX3010X_BIT_TEMP_EN);
 }
 
-bool MassmoreMAX3010x::isTemperatureReady() {
+bool Massmore_MAX3010x::isTemperatureReady() {
   uint8_t config = 0;
-  if (!readRegister8(MASSMORE_MAX3010X_REG_DIE_TEMP_CONFIG, config)) {
-    return false;
-  }
-  /* บิต TEMP_EN เคลียร์ตัวเองเมื่อวัดเสร็จ */
-  if ((config & MASSMORE_MAX3010X_BIT_TEMP_EN) == 0) {
-    return true;
-  }
-  /* เผื่อไว้อีกทาง ดูแฟล็ก DIE_TEMP_RDY ในรีจิสเตอร์สถานะชุดที่ 2 */
+  if (!readRegister8(MASSMORE_MAX3010X_REG_DIE_TEMP_CONFIG, config)) return false;
+  if ((config & MASSMORE_MAX3010X_BIT_TEMP_EN) == 0) return true; /* TEMP_EN self-clear */
   uint8_t status = 0;
-  if (readRegister8(MASSMORE_MAX3010X_REG_INT_STATUS_2, status) &&
-      (status & MASSMORE_MAX3010X_INT_DIE_TEMP_RDY)) {
+  if (readRegister8(MASSMORE_MAX3010X_REG_INT_STATUS_2, status) && (status & MASSMORE_MAX3010X_INT_DIE_TEMP_RDY)) {
     return true;
   }
+  _lastError = ErrorCode::NOT_READY;
   return false;
 }
 
-float MassmoreMAX3010x::getTemperatureResult() {
-  uint8_t integerPart = 0;
-  uint8_t fractionPart = 0;
-  if (!readRegister8(MASSMORE_MAX3010X_REG_DIE_TEMP_INT, integerPart)) {
-    return NAN;
-  }
-  if (!readRegister8(MASSMORE_MAX3010X_REG_DIE_TEMP_FRAC, fractionPart)) {
-    return NAN;
-  }
-  /* ส่วนจำนวนเต็มเป็นเลขมีเครื่องหมายแบบ 2's complement
-     ส่วนทศนิยมเป็นบวกเสมอ ละเอียดขั้นละ 0.0625 องศา */
-  int8_t signedInteger = (int8_t)integerPart;
-  return (float)signedInteger +
-         (float)(fractionPart & 0x0F) * MASSMORE_MAX3010X_TEMP_FRAC_STEP;
+float Massmore_MAX3010x::getTemperatureResult() {
+  uint8_t integerPart = 0, fractionPart = 0;
+  if (!readRegister8(MASSMORE_MAX3010X_REG_DIE_TEMP_INT, integerPart)) return NAN;
+  if (!readRegister8(MASSMORE_MAX3010X_REG_DIE_TEMP_FRAC, fractionPart)) return NAN;
+  /* TINT = signed 8-bit (2's complement), TFRAC = 4-bit x 0.0625 C */
+  return (float)(int8_t)integerPart + (float)(fractionPart & 0x0F) * MASSMORE_MAX3010X_TEMP_FRAC_STEP;
 }
 
-float MassmoreMAX3010x::readTemperature(uint32_t timeoutMs) {
+float Massmore_MAX3010x::readTemperature(uint32_t timeoutMs) {
   if (!_begun) {
-    _lastError = MASSMORE_MAX3010X_ERR_NOT_BEGUN;
+    _lastError = ErrorCode::NOT_BEGUN;
     return NAN;
   }
-  if (!startTemperatureConversion()) {
-    return NAN;
-  }
-
-  uint32_t start = millis();
+  if (!startTemperatureConversion()) return NAN;
+  const uint32_t start = millis();
   while ((uint32_t)(millis() - start) < timeoutMs) {
-    if (isTemperatureReady()) {
-      return getTemperatureResult();
-    }
+    if (isTemperatureReady()) return getTemperatureResult();
     delay(1);
   }
-
-  _lastError = MASSMORE_MAX3010X_ERR_TIMEOUT;
+  _lastError = ErrorCode::TIMEOUT;
   return NAN;
 }
 
-float MassmoreMAX3010x::readTemperatureF(uint32_t timeoutMs) {
-  float celsius = readTemperature(timeoutMs);
-  if (isnan(celsius)) {
-    return NAN;
-  }
-  return celsius * 1.8f + 32.0f;
-}
-
 /* =========================================================================
-   รหัสประจำตัวชิปและการเดารุ่น
+   Identity / variant
    ========================================================================= */
 
-uint8_t MassmoreMAX3010x::readPartID() {
-  return readRegister8(MASSMORE_MAX3010X_REG_PART_ID);
-}
+uint8_t Massmore_MAX3010x::readPartID() { return readRegister8(MASSMORE_MAX3010X_REG_PART_ID); }
+uint8_t Massmore_MAX3010x::readRevisionID() { return readRegister8(MASSMORE_MAX3010X_REG_REVISION_ID); }
 
-uint8_t MassmoreMAX3010x::readRevisionID() {
-  return readRegister8(MASSMORE_MAX3010X_REG_REVISION_ID);
-}
-
-void MassmoreMAX3010x::setVariant(massmore_max3010x_variant_t variant) {
-  _variant = variant;
-  _variantForced = (variant != MASSMORE_MAX3010X_VARIANT_AUTO);
-}
-
-bool MassmoreMAX3010x::hasGreenLed() const {
-  return _variant == MASSMORE_MAX3010X_VARIANT_MAX30101 ||
-         _variant == MASSMORE_MAX3010X_VARIANT_MAX30105;
-}
-
-bool MassmoreMAX3010x::hasProximity() const {
-  return _variant == MASSMORE_MAX3010X_VARIANT_MAX30105;
-}
-
-const char *MassmoreMAX3010x::getVariantName() const {
-  switch (_variant) {
-    case MASSMORE_MAX3010X_VARIANT_MAX30102:
-      return "MAX30102";
-    case MASSMORE_MAX3010X_VARIANT_MAX30101:
-      return "MAX30101";
-    case MASSMORE_MAX3010X_VARIANT_MAX30105:
-      return "MAX30105";
-    default:
-      return "MAX3010x";
-  }
-}
-
-bool MassmoreMAX3010x::detectVariant() {
-  /* ทั้งสามรุ่นคืน PART_ID = 0x15 เท่ากันหมด จึงต้องเดาจากรีจิสเตอร์ที่
-     "มีเฉพาะบางรุ่น" แทน  รีจิสเตอร์ที่ไม่มีอยู่จริงจะอ่านกลับมาเป็น 0 เสมอ
-     แม้จะเขียนค่าลงไปแล้วก็ตาม
-
-       LED3_PA (0x0E)          มีใน MAX30101 และ MAX30105 ไม่มีใน MAX30102
-       LED4_PA (0x0F)          มีเฉพาะ MAX30101 ซึ่งมีไดรเวอร์ LED สีเขียวสองดวง
-       PROX_INT_THRESH (0x30)  มีเฉพาะ MAX30105  ส่วน MAX30101 ตัดฟังก์ชัน
-                               proximity ออกไปแล้วตั้งแต่ datasheet รีวิชัน 1 */
-  _variant = MASSMORE_MAX3010X_VARIANT_MAX30102;
-
-  const uint8_t probe = 0x2A; /* ค่าทดสอบ ไม่ใช่ 0x00 และไม่ใช่ 0xFF */
-  uint8_t savedLed3 = 0;
-  uint8_t readback = 0;
-
-  readRegister8(MASSMORE_MAX3010X_REG_LED3_PA, savedLed3);
-  if (!writeRegister8(MASSMORE_MAX3010X_REG_LED3_PA, probe)) {
+bool Massmore_MAX3010x::verifyChipID() {
+  uint8_t partId = 0;
+  if (!readRegister8(MASSMORE_MAX3010X_REG_PART_ID, partId)) return false;
+  if (partId != MASSMORE_MAX3010X_PART_ID_EXPECTED) {
+    _lastError = ErrorCode::WRONG_ID;
     return false;
   }
-  if (!readRegister8(MASSMORE_MAX3010X_REG_LED3_PA, readback)) {
-    return false;
-  }
-  writeRegister8(MASSMORE_MAX3010X_REG_LED3_PA, savedLed3);
-
-  if (readback != probe) {
-    /* ไม่มีไดรเวอร์ LED ช่องที่ 3 แปลว่าเป็น MAX30102 */
-    _lastError = MASSMORE_MAX3010X_OK;
-    return true;
-  }
-
-  /* มี LED3 แล้ว ลองหาไดรเวอร์ช่องที่ 4 ซึ่งมีเฉพาะ MAX30101 */
-  uint8_t savedLed4 = 0;
-  readRegister8(MASSMORE_MAX3010X_REG_LED4_PA, savedLed4);
-  if (writeRegister8(MASSMORE_MAX3010X_REG_LED4_PA, probe) &&
-      readRegister8(MASSMORE_MAX3010X_REG_LED4_PA, readback)) {
-    writeRegister8(MASSMORE_MAX3010X_REG_LED4_PA, savedLed4);
-    if (readback == probe) {
-      _variant = MASSMORE_MAX3010X_VARIANT_MAX30101;
-      _lastError = MASSMORE_MAX3010X_OK;
-      return true;
-    }
-  }
-
-  /* ไม่มี LED4 เหลือยืนยันด้วยรีจิสเตอร์ proximity ว่าเป็น MAX30105 จริง */
-  uint8_t savedProx = 0;
-  readRegister8(MASSMORE_MAX3010X_REG_PROX_INT_THRESH, savedProx);
-  if (!writeRegister8(MASSMORE_MAX3010X_REG_PROX_INT_THRESH, probe)) {
-    return false;
-  }
-  if (!readRegister8(MASSMORE_MAX3010X_REG_PROX_INT_THRESH, readback)) {
-    return false;
-  }
-  writeRegister8(MASSMORE_MAX3010X_REG_PROX_INT_THRESH, savedProx);
-
-  /* ถ้าไม่พบทั้ง LED4 และ proximity ก็ยังถือว่าเป็น MAX30105 เพราะมี LED สีเขียว
-     ครบตามคุณสมบัติหลักของรุ่นนั้น และเป็นรุ่นที่พบบ่อยกว่าในบอร์ดทั่วไป */
-  _variant = MASSMORE_MAX3010X_VARIANT_MAX30105;
-  (void)readback;
-  _lastError = MASSMORE_MAX3010X_OK;
+  _lastError = ErrorCode::OK;
   return true;
 }
 
-uint8_t MassmoreMAX3010x::milliAmpToLedCode(float milliAmp) {
-  /* เทียบกับตัวเองเพื่อจับ NaN ซึ่งไม่เท่ากับอะไรเลยแม้แต่ตัวมันเอง
-     ถ้าไม่ดักไว้ การแปลง NaN เป็น uint8_t จะเป็นพฤติกรรมที่ไม่นิยาม */
-  if (!(milliAmp == milliAmp) || milliAmp <= 0.0f) {
-    return 0;
+uint32_t Massmore_MAX3010x::getSerialNumber() {
+  /* MAX3010x ไม่มี serial-number / lot register ใน datasheet — คืน 0 */
+  return 0;
+}
+
+bool Massmore_MAX3010x::isGenuine() { return verifyChip() == Genuine::PASS; }
+
+void Massmore_MAX3010x::setVariant(Variant variant) {
+  _variant = variant;
+  _variantForced = (variant != Variant::AUTO);
+}
+
+bool Massmore_MAX3010x::hasGreenLed() const {
+  return _variant == Variant::MAX30101 || _variant == Variant::MAX30105;
+}
+bool Massmore_MAX3010x::hasProximity() const { return _variant == Variant::MAX30105; }
+
+const char *Massmore_MAX3010x::getVariantName() const {
+  switch (_variant) {
+    case Variant::MAX30102: return "MAX30102";
+    case Variant::MAX30101: return "MAX30101";
+    case Variant::MAX30105: return "MAX30105";
+    default: return "MAX3010x";
   }
+}
+
+bool Massmore_MAX3010x::detectVariant() {
+  /* ทุกรุ่นคืน PART_ID 0x15 จึงเดาจาก register ที่มีเฉพาะรุ่น (register ที่ไม่มีจริงอ่านได้ 0)
+       LED3_PA (0x0E)  MAX30101 / MAX30105
+       LED4_PA (0x0F)  MAX30101 เท่านั้น
+       PROX_INT_THRESH (0x30)  MAX30105 เท่านั้น */
+  _variant = Variant::MAX30102;
+  const uint8_t probe = 0x2A;
+  uint8_t saved = 0, readback = 0;
+
+  readRegister8(MASSMORE_MAX3010X_REG_LED3_PA, saved);
+  if (!writeRegister8(MASSMORE_MAX3010X_REG_LED3_PA, probe)) return false;
+  if (!readRegister8(MASSMORE_MAX3010X_REG_LED3_PA, readback)) return false;
+  writeRegister8(MASSMORE_MAX3010X_REG_LED3_PA, saved);
+  if (readback != probe) {
+    _lastError = ErrorCode::OK;
+    return true; /* ไม่มี LED3 = MAX30102 */
+  }
+
+  readRegister8(MASSMORE_MAX3010X_REG_LED4_PA, saved);
+  if (writeRegister8(MASSMORE_MAX3010X_REG_LED4_PA, probe) && readRegister8(MASSMORE_MAX3010X_REG_LED4_PA, readback)) {
+    writeRegister8(MASSMORE_MAX3010X_REG_LED4_PA, saved);
+    if (readback == probe) {
+      _variant = Variant::MAX30101;
+      _lastError = ErrorCode::OK;
+      return true;
+    }
+  }
+  _variant = Variant::MAX30105;
+  _lastError = ErrorCode::OK;
+  return true;
+}
+
+uint8_t Massmore_MAX3010x::milliAmpToLedCode(float milliAmp) {
+  if (!(milliAmp == milliAmp) || milliAmp <= 0.0f) return 0; /* NaN guard */
   float code = milliAmp / MASSMORE_MAX3010X_LED_STEP_MA + 0.5f;
-  if (code > 255.0f) {
-    return 255;
-  }
-  return (uint8_t)code;
+  return (code > 255.0f) ? 255 : (uint8_t)code;
 }
 
-float MassmoreMAX3010x::getEffectiveSampleRate() const {
-  static const uint16_t rateTable[8] = {50,  100,  200,  400,
-                                        800, 1000, 1600, 3200};
+float Massmore_MAX3010x::getEffectiveSampleRate() const {
+  static const uint16_t rateTable[8] = {50, 100, 200, 400, 800, 1000, 1600, 3200};
   static const uint8_t averageTable[6] = {1, 2, 4, 8, 16, 32};
-
-  uint8_t rateIndex = (uint8_t)_sampleRate;
-  uint8_t aveIndex = (uint8_t)_sampleAverage;
-  if (rateIndex > 7) rateIndex = 7;
-  if (aveIndex > 5) aveIndex = 5;
-
-  return (float)rateTable[rateIndex] / (float)averageTable[aveIndex];
+  uint8_t r = (uint8_t)_sampleRate, a = (uint8_t)_sampleAverage;
+  if (r > 7) r = 7;
+  if (a > 5) a = 5;
+  return (float)rateTable[r] / (float)averageTable[a];
 }
 
-/* =========================================================================
-   อ่านการตั้งค่ากลับมาจากชิป
-   ========================================================================= */
-
-bool MassmoreMAX3010x::readConfiguration(massmore_max3010x_config_t &out) {
+bool Massmore_MAX3010x::readConfiguration(Config &out) {
   if (!_begun) {
-    _lastError = MASSMORE_MAX3010X_ERR_NOT_BEGUN;
+    _lastError = ErrorCode::NOT_BEGUN;
     return false;
   }
-
-  uint8_t modeConfig = 0;
-  uint8_t spo2Config = 0;
-  uint8_t fifoConfig = 0;
-  bool ok = true;
-
-  ok = readRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, modeConfig) && ok;
+  uint8_t modeConfig = 0, spo2Config = 0, fifoConfig = 0;
+  bool ok = readRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, modeConfig);
   ok = readRegister8(MASSMORE_MAX3010X_REG_SPO2_CONFIG, spo2Config) && ok;
   ok = readRegister8(MASSMORE_MAX3010X_REG_FIFO_CONFIG, fifoConfig) && ok;
   ok = readRegister8(MASSMORE_MAX3010X_REG_PART_ID, out.partId) && ok;
@@ -1026,144 +735,105 @@ bool MassmoreMAX3010x::readConfiguration(massmore_max3010x_config_t &out) {
   ok = readRegister8(MASSMORE_MAX3010X_REG_LED2_PA, out.ledIr) && ok;
   ok = readRegister8(MASSMORE_MAX3010X_REG_LED3_PA, out.ledGreen) && ok;
   ok = readRegister8(MASSMORE_MAX3010X_REG_PILOT_PA, out.ledPilot) && ok;
-  if (!ok) {
-    return false;
-  }
+  if (!ok) return false;
 
-  /* ค่า MODE 0 และ 1 เป็นค่าที่ datasheet ระบุว่า "ห้ามใช้" ซึ่งเป็นค่าหลังรีเซ็ต
-     ตอนที่ยังไม่มีใครสั่งโหมดให้ชิป กรณีนั้นห้ามเดาเป็น SPO2 เด็ดขาด
-     เพราะจะทำให้ไลบรารีคิดว่ามีข้อมูล 2 ช่องแล้วแกะ FIFO ผิดความยาว */
   bool modeValid = true;
   switch (modeConfig & 0x07) {
-    case MASSMORE_MAX3010X_MODE_VAL_HR:
-      out.mode = MASSMORE_MAX3010X_MODE_HR;
-      break;
-    case MASSMORE_MAX3010X_MODE_VAL_SPO2:
-      out.mode = MASSMORE_MAX3010X_MODE_SPO2;
-      break;
-    case MASSMORE_MAX3010X_MODE_VAL_MULTI_LED:
-      out.mode = MASSMORE_MAX3010X_MODE_MULTI_LED;
-      break;
-    default:
-      /* ชิปยังไม่ได้ตั้งโหมด รายงานค่าที่ไลบรารีจำไว้แทน แล้วไม่แตะสถานะภายใน */
-      out.mode = _mode;
-      modeValid = false;
-      break;
+    case MASSMORE_MAX3010X_MODE_VAL_HR: out.mode = Mode::HEART_RATE; break;
+    case MASSMORE_MAX3010X_MODE_VAL_SPO2: out.mode = Mode::SPO2; break;
+    case MASSMORE_MAX3010X_MODE_VAL_MULTI_LED: out.mode = Mode::MULTI_LED; break;
+    default: out.mode = _mode; modeValid = false; break; /* MODE 0/1 = "do not use" หลัง POR */
   }
-
   out.shutdown = (modeConfig & MASSMORE_MAX3010X_BIT_SHUTDOWN) != 0;
-  out.adcRange = (massmore_max3010x_adc_range_t)((spo2Config >> 5) & 0x03);
-  out.sampleRate = (massmore_max3010x_rate_t)((spo2Config >> 2) & 0x07);
-  out.pulseWidth = (massmore_max3010x_pulse_width_t)(spo2Config & 0x03);
-
+  out.adcRange = (AdcRange)((spo2Config >> 5) & 0x03);
+  out.sampleRate = (SampleRate)((spo2Config >> 2) & 0x07);
+  out.pulseWidth = (PulseWidth)(spo2Config & 0x03);
   uint8_t average = (uint8_t)((fifoConfig >> 5) & 0x07);
-  if (average > (uint8_t)MASSMORE_MAX3010X_SMP_AVE_32) {
-    average = (uint8_t)MASSMORE_MAX3010X_SMP_AVE_32;
-  }
-  out.sampleAverage = (massmore_max3010x_smp_ave_t)average;
+  if (average > (uint8_t)SampleAverage::X32) average = (uint8_t)SampleAverage::X32;
+  out.sampleAverage = (SampleAverage)average;
   out.fifoRollover = (fifoConfig & MASSMORE_MAX3010X_BIT_ROLLOVER_EN) != 0;
   out.fifoAlmostFull = (uint8_t)(fifoConfig & 0x0F);
 
-  /* ซิงก์สำเนาภายในให้ตรงกับชิปจริง แล้วค่อยคำนวณค่าที่เหลือ */
   _sampleRate = out.sampleRate;
   _sampleAverage = out.sampleAverage;
   if (modeValid) {
     _mode = out.mode;
     recomputeChannels();
   }
-
   out.variant = _variant;
   out.activeChannels = _activeChannels;
   out.effectiveRateHz = getEffectiveSampleRate();
-
-  _lastError = MASSMORE_MAX3010X_OK;
+  _lastError = ErrorCode::OK;
   return true;
 }
 
 /* =========================================================================
-   ตรวจสอบว่าเป็นชิปแท้
+   Authenticity (11 checks)
    ========================================================================= */
 
-const char *MassmoreMAX3010x::getVerifyCheckName(uint8_t index) {
+const char *Massmore_MAX3010x::getVerifyCheckName(uint8_t index) {
   switch (index) {
-    case 0: return "ACK ที่ address 0x57";
-    case 1: return "PART_ID = 0x15";
-    case 2: return "REV_ID สมเหตุสมผล";
-    case 3: return "บิต RESET เคลียร์ตัวเองได้";
-    case 4: return "ค่าหลังรีเซ็ตตรงตาม datasheet";
-    case 5: return "เขียนอ่านรีจิสเตอร์ได้ตรง";
-    case 6: return "PART_ID เขียนทับไม่ได้";
-    case 7: return "บิตสงวนเป็นศูนย์";
-    case 8: return "ตัวชี้ FIFO เป็นฟิลด์ 5 บิต";
-    case 9: return "เซ็นเซอร์อุณหภูมิในตัวทำงาน";
-    case 10: return "ADC ตอบสนองเมื่อเปิด LED";
-    default: return "ไม่ทราบ";
+    case 0: return "ACK at 0x57";
+    case 1: return "PART_ID == 0x15";
+    case 2: return "REV_ID valid";
+    case 3: return "RESET self-clears";
+    case 4: return "POR defaults";
+    case 5: return "Register R/W";
+    case 6: return "PART_ID read-only";
+    case 7: return "Reserved bits zero";
+    case 8: return "FIFO pointer 5-bit";
+    case 9: return "Die temp sane";
+    case 10: return "LED/ADC response";
+    default: return "?";
   }
 }
 
-uint8_t MassmoreMAX3010x::getVerifyPassCount() const {
+uint8_t Massmore_MAX3010x::getVerifyPassCount() const {
   uint8_t count = 0;
-  for (uint8_t i = 0; i < MASSMORE_MAX3010X_CHK_COUNT; i++) {
-    if (_verifyMask & (1u << i)) {
-      count++;
-    }
+  for (uint8_t i = 0; i < CHK_COUNT; i++) {
+    if (_verifyMask & (1u << i)) count++;
   }
   return count;
 }
 
-massmore_max3010x_genuine_t MassmoreMAX3010x::verifyChip() {
+Massmore_MAX3010x::Genuine Massmore_MAX3010x::verifyChip() {
   _verifyMask = 0;
 
-  /* ---- ข้อ 1  ชิปตอบ ACK ที่ address ---- */
-  if (!isConnected()) {
-    return MASSMORE_MAX3010X_GENUINE_NOT_MAX3010X;
-  }
-  _verifyMask |= MASSMORE_MAX3010X_CHK_ACK;
+  /* 1. ACK */
+  if (!isConnected()) return Genuine::NOT_MAX3010X;
+  _verifyMask |= CHK_ACK;
 
-  /* ---- ข้อ 2  PART_ID ต้องเป็น 0x15 ---- */
+  /* 2. PART_ID */
   uint8_t partId = 0;
-  if (!readRegister8(MASSMORE_MAX3010X_REG_PART_ID, partId)) {
-    return MASSMORE_MAX3010X_GENUINE_NOT_MAX3010X;
-  }
-  if (partId != MASSMORE_MAX3010X_PART_ID_EXPECTED) {
-    /* ไม่ใช่ชิปตระกูลนี้แน่นอน ไม่ต้องตรวจต่อ */
-    return MASSMORE_MAX3010X_GENUINE_NOT_MAX3010X;
-  }
-  _verifyMask |= MASSMORE_MAX3010X_CHK_PART_ID;
+  if (!readRegister8(MASSMORE_MAX3010X_REG_PART_ID, partId)) return Genuine::NOT_MAX3010X;
+  if (partId != MASSMORE_MAX3010X_PART_ID_EXPECTED) return Genuine::NOT_MAX3010X;
+  _verifyMask |= CHK_PART_ID;
 
-  /* ---- ข้อ 3  REV_ID ต้องไม่ใช่ 0x00 และไม่ใช่ 0xFF ----
-     ชิปแท้ที่ผลิตจริงจะมีเลขรีวิชันเสมอ ของเลียนแบบมักปล่อยว่างหรือค้างที่ FF */
+  /* 3. REV_ID ไม่ใช่ 0x00 / 0xFF */
   uint8_t revId = 0;
-  if (readRegister8(MASSMORE_MAX3010X_REG_REVISION_ID, revId) &&
-      revId != 0x00 && revId != 0xFF) {
-    _verifyMask |= MASSMORE_MAX3010X_CHK_REV_ID;
+  if (readRegister8(MASSMORE_MAX3010X_REG_REVISION_ID, revId) && revId != 0x00 && revId != 0xFF) {
+    _verifyMask |= CHK_REV_ID;
   }
 
-  /* ---- ข้อ 4  สั่ง RESET แล้วบิตต้องเคลียร์ตัวเองภายใน 100 ms ---- */
-  bool resetOk = maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG,
-                               MASSMORE_MAX3010X_MASK_RESET,
-                               MASSMORE_MAX3010X_BIT_RESET) &&
-                 waitForBit(MASSMORE_MAX3010X_REG_MODE_CONFIG,
-                            MASSMORE_MAX3010X_BIT_RESET, false, _timeoutMs);
-  if (resetOk) {
-    _verifyMask |= MASSMORE_MAX3010X_CHK_RESET;
-  }
-  _mode = MASSMORE_MAX3010X_MODE_HR;
-  _sampleAverage = MASSMORE_MAX3010X_SMP_AVE_1;
-  _sampleRate = MASSMORE_MAX3010X_RATE_50;
+  /* 4. RESET self-clear */
+  const bool resetOk =
+      maskRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, MASSMORE_MAX3010X_MASK_RESET, MASSMORE_MAX3010X_BIT_RESET) &&
+      waitForBit(MASSMORE_MAX3010X_REG_MODE_CONFIG, MASSMORE_MAX3010X_BIT_RESET, false, _timeoutMs);
+  if (resetOk) _verifyMask |= CHK_RESET;
+  _mode = Mode::HEART_RATE;
+  _sampleAverage = SampleAverage::X1;
+  _sampleRate = SampleRate::HZ_50;
   recomputeChannels();
   flush();
 
-  /* ---- ข้อ 5  ค่าหลังรีเซ็ตต้องตรงกับตาราง power-on-reset ของ datasheet ---- */
+  /* 5. POR defaults ตามตาราง Register Map ของ datasheet (ทุกตัวเป็น 0x00) */
   if (resetOk) {
+    static const uint8_t zeroRegs[] = {
+        MASSMORE_MAX3010X_REG_INT_ENABLE_1, MASSMORE_MAX3010X_REG_INT_ENABLE_2, MASSMORE_MAX3010X_REG_FIFO_WR_PTR,
+        MASSMORE_MAX3010X_REG_OVF_COUNTER,  MASSMORE_MAX3010X_REG_FIFO_RD_PTR,  MASSMORE_MAX3010X_REG_FIFO_CONFIG,
+        MASSMORE_MAX3010X_REG_MODE_CONFIG,  MASSMORE_MAX3010X_REG_SPO2_CONFIG,  MASSMORE_MAX3010X_REG_LED1_PA,
+        MASSMORE_MAX3010X_REG_LED2_PA,      MASSMORE_MAX3010X_REG_MULTI_LED_1,  MASSMORE_MAX3010X_REG_MULTI_LED_2};
     bool defaultsOk = true;
-    const uint8_t zeroRegs[] = {
-        MASSMORE_MAX3010X_REG_INT_ENABLE_1, MASSMORE_MAX3010X_REG_INT_ENABLE_2,
-        MASSMORE_MAX3010X_REG_FIFO_WR_PTR,  MASSMORE_MAX3010X_REG_OVF_COUNTER,
-        MASSMORE_MAX3010X_REG_FIFO_RD_PTR,  MASSMORE_MAX3010X_REG_FIFO_CONFIG,
-        MASSMORE_MAX3010X_REG_MODE_CONFIG,  MASSMORE_MAX3010X_REG_SPO2_CONFIG,
-        MASSMORE_MAX3010X_REG_LED1_PA,      MASSMORE_MAX3010X_REG_LED2_PA,
-        MASSMORE_MAX3010X_REG_MULTI_LED_1,  MASSMORE_MAX3010X_REG_MULTI_LED_2};
     for (uint8_t i = 0; i < sizeof(zeroRegs); i++) {
       uint8_t value = 0xAA;
       if (!readRegister8(zeroRegs[i], value) || value != 0x00) {
@@ -1171,98 +841,76 @@ massmore_max3010x_genuine_t MassmoreMAX3010x::verifyChip() {
         break;
       }
     }
-    if (defaultsOk) {
-      _verifyMask |= MASSMORE_MAX3010X_CHK_POR_DEFAULT;
-    }
+    if (defaultsOk) _verifyMask |= CHK_POR_DEFAULT;
   }
 
-  /* ---- ข้อ 6  เขียนค่าลงรีจิสเตอร์อ่านเขียนได้แล้วต้องอ่านกลับมาตรง ---- */
+  /* 6. R/W pattern บน LED1_PA */
   {
+    static const uint8_t patterns[] = {0x55, 0xAA, 0x01, 0xFE};
     bool rwOk = true;
-    const uint8_t patterns[] = {0x55, 0xAA, 0x01, 0xFE};
     for (uint8_t i = 0; i < sizeof(patterns) && rwOk; i++) {
       uint8_t readback = 0;
       if (!writeRegister8(MASSMORE_MAX3010X_REG_LED1_PA, patterns[i]) ||
-          !readRegister8(MASSMORE_MAX3010X_REG_LED1_PA, readback) ||
-          readback != patterns[i]) {
+          !readRegister8(MASSMORE_MAX3010X_REG_LED1_PA, readback) || readback != patterns[i]) {
         rwOk = false;
       }
     }
     writeRegister8(MASSMORE_MAX3010X_REG_LED1_PA, 0x00);
-    if (rwOk) {
-      _verifyMask |= MASSMORE_MAX3010X_CHK_RW;
-    }
+    if (rwOk) _verifyMask |= CHK_RW;
   }
 
-  /* ---- ข้อ 7  PART_ID เป็นรีจิสเตอร์อ่านอย่างเดียวจริงหรือไม่ ----
-     ชิปแท้จะไม่ยอมให้เขียนทับ ของเลียนแบบที่จำลองด้วย MCU มักเขียนทับได้ */
+  /* 7. PART_ID ต้อง read-only (ของเลียนแบบที่จำลองด้วย MCU มักเขียนทับได้) */
   {
     writeRegister8(MASSMORE_MAX3010X_REG_PART_ID, 0x00);
     uint8_t readback = 0;
-    if (readRegister8(MASSMORE_MAX3010X_REG_PART_ID, readback) &&
-        readback == MASSMORE_MAX3010X_PART_ID_EXPECTED) {
-      _verifyMask |= MASSMORE_MAX3010X_CHK_READONLY;
+    if (readRegister8(MASSMORE_MAX3010X_REG_PART_ID, readback) && readback == MASSMORE_MAX3010X_PART_ID_EXPECTED) {
+      _verifyMask |= CHK_READONLY;
     }
   }
 
-  /* ---- ข้อ 8  บิตสงวน 5:3 ของ MODE_CONFIG ต้องอ่านกลับมาเป็นศูนย์เสมอ ---- */
+  /* 8. Reserved bits 5:3 ของ MODE_CONFIG ต้องอ่านได้ 0 */
   {
     writeRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, 0x38);
     uint8_t readback = 0xFF;
-    if (readRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, readback) &&
-        (readback & 0x38) == 0x00) {
-      _verifyMask |= MASSMORE_MAX3010X_CHK_RESERVED;
+    if (readRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, readback) && (readback & 0x38) == 0x00) {
+      _verifyMask |= CHK_RESERVED;
     }
     writeRegister8(MASSMORE_MAX3010X_REG_MODE_CONFIG, 0x00);
   }
 
-  /* ---- ข้อ 9  ตัวชี้ FIFO เป็นฟิลด์ 5 บิต เขียน 0x20 ต้องวนกลับเป็น 0 ---- */
+  /* 9. FIFO pointer เป็น 5-bit field: เขียน 0x20 ต้องอ่านกลับ 0x00 */
   {
-    bool pointerOk = true;
+    bool ptrOk = true;
     uint8_t readback = 0;
-    /* เทียบทั้งไบต์ ไม่ใช่แค่ 5 บิตล่าง เพราะบิต 7:5 ของชิปแท้อ่านได้ 0 เสมอ
-       ของเลียนแบบที่ทำตัวชี้เป็นไบต์เต็มจะเก็บ 0x20 ไว้แล้วอ่านกลับมาไม่ใช่ 0 */
     if (!writeRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, 0x1F) ||
-        !readRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, readback) ||
-        readback != 0x1F) {
-      pointerOk = false;
+        !readRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, readback) || readback != 0x1F) {
+      ptrOk = false;
     }
-    if (pointerOk) {
-      if (!writeRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, 0x20) ||
-          !readRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, readback) ||
-          readback != 0x00) {
-        pointerOk = false;
-      }
+    if (ptrOk && (!writeRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, 0x20) ||
+                  !readRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, readback) || readback != 0x00)) {
+      ptrOk = false;
     }
     writeRegister8(MASSMORE_MAX3010X_REG_FIFO_WR_PTR, 0x00);
-    if (pointerOk) {
-      _verifyMask |= MASSMORE_MAX3010X_CHK_FIFO_PTR;
-    }
+    if (ptrOk) _verifyMask |= CHK_FIFO_PTR;
   }
 
-  /* ---- ข้อ 10  เซ็นเซอร์อุณหภูมิในตัวต้องให้ค่าที่เป็นไปได้ ----
-     ชิปทำงานได้ในช่วง -40 ถึง 85 องศา เราใช้เกณฑ์กว้างกว่าอุณหภูมิห้องเล็กน้อย
-     เพื่อให้ทดสอบได้ทั้งในห้องแอร์และในสายการผลิตที่ร้อนกว่า */
+  /* 10. Die temperature อยู่ในช่วง operating range (-40..+85 C) */
   {
-    float dieTemp = readTemperature(120);
-    if (!isnan(dieTemp) && dieTemp > -20.0f && dieTemp < 85.0f) {
-      _verifyMask |= MASSMORE_MAX3010X_CHK_TEMP;
-    }
+    const float dieTemp = readTemperature(120);
+    if (!isnan(dieTemp) && dieTemp > -40.0f && dieTemp < 85.0f) _verifyMask |= CHK_TEMP;
   }
 
-  /* ---- ข้อ 11  เปิด LED แล้วค่าที่ ADC อ่านได้ต้องขยับจริง ----
-     เป็นการพิสูจน์ว่ามีภาคออปติกอยู่จริง ไม่ใช่แค่ MCU จำลองรีจิสเตอร์ */
+  /* 11. เปิด LED แล้ว ADC ต้องขยับจริง (พิสูจน์ว่ามี optical front-end) */
   {
     setFifoRollover(true);
-    setSampleAverage(MASSMORE_MAX3010X_SMP_AVE_4);
-    setAdcRange(MASSMORE_MAX3010X_ADC_RANGE_4096);
-    setSampleRate(MASSMORE_MAX3010X_RATE_400);
-    setPulseWidth(MASSMORE_MAX3010X_PULSE_411US);
+    setSampleAverage(SampleAverage::X4);
+    setAdcRange(AdcRange::NA_4096);
+    setSampleRate(SampleRate::HZ_400);
+    setPulseWidth(PulseWidth::US_411);
 
-    /* รอบแรก ปิด LED ทุกดวง ค่าที่อ่านได้ควรต่ำมาก */
     setPulseAmplitudeRed(0);
     setPulseAmplitudeIR(0);
-    setMode(MASSMORE_MAX3010X_MODE_SPO2);
+    setMode(Mode::SPO2);
     clearFifo();
     delay(60);
     update();
@@ -1273,7 +921,6 @@ massmore_max3010x_genuine_t MassmoreMAX3010x::verifyChip() {
       nextSample();
     }
 
-    /* รอบสอง เปิด LED แรง ๆ ค่าที่อ่านได้ต้องสูงขึ้นอย่างมีนัยสำคัญ */
     setPulseAmplitudeRed(0x7F);
     setPulseAmplitudeIR(0x7F);
     clearFifo();
@@ -1285,59 +932,249 @@ massmore_max3010x_genuine_t MassmoreMAX3010x::verifyChip() {
       if (getRed() > litMax) litMax = getRed();
       nextSample();
     }
-
-    /* เกณฑ์ผ่าน  ต้องมีค่าจริงออกมา และต้องต่างจากตอนปิด LED ชัดเจน */
-    if (litMax > 0 && litMax > darkMax + 200) {
-      _verifyMask |= MASSMORE_MAX3010X_CHK_LED;
-    }
+    if (litMax > 0 && litMax > darkMax + 200) _verifyMask |= CHK_LED;
 
     setPulseAmplitudeRed(0);
     setPulseAmplitudeIR(0);
-    setMode(MASSMORE_MAX3010X_MODE_HR);
+    setMode(Mode::HEART_RATE);
     clearFifo();
   }
 
-  uint8_t passCount = getVerifyPassCount();
-  if (passCount == MASSMORE_MAX3010X_CHK_COUNT) {
-    return MASSMORE_MAX3010X_GENUINE_PASS;
-  }
-  if (passCount >= MASSMORE_MAX3010X_CHK_COUNT - 2) {
-    return MASSMORE_MAX3010X_GENUINE_PARTIAL;
-  }
-  return MASSMORE_MAX3010X_GENUINE_SUSPECT;
+  const uint8_t passCount = getVerifyPassCount();
+  if (passCount == CHK_COUNT) return Genuine::PASS;
+  if (passCount >= CHK_COUNT - 2) return Genuine::PARTIAL;
+  return Genuine::SUSPECT;
 }
 
 /* =========================================================================
-   ข้อความอธิบายข้อผิดพลาด
+   Error strings (English — machine-readable Factory Test output)
    ========================================================================= */
 
-const char *MassmoreMAX3010x::errorToString(massmore_max3010x_error_t error) {
+const char *Massmore_MAX3010x::errorToString(ErrorCode error) {
   switch (error) {
-    case MASSMORE_MAX3010X_OK:
-      return "สำเร็จ";
-    case MASSMORE_MAX3010X_ERR_NOT_BEGUN:
-      return "ยังไม่ได้เรียก begin()";
-    case MASSMORE_MAX3010X_ERR_NO_DEVICE:
-      return "ไม่พบอุปกรณ์บนบัส I2C ที่ address นี้";
-    case MASSMORE_MAX3010X_ERR_I2C_WRITE:
-      return "เขียนข้อมูลลงบัส I2C ไม่สำเร็จ";
-    case MASSMORE_MAX3010X_ERR_I2C_READ:
-      return "อ่านข้อมูลจากบัส I2C ได้ไม่ครบ";
-    case MASSMORE_MAX3010X_ERR_TIMEOUT:
-      return "รอเกินเวลาที่กำหนด";
-    case MASSMORE_MAX3010X_ERR_WRONG_CHIP:
-      return "PART_ID ไม่ใช่ 0x15 อาจเป็น MAX30100 หรือชิปคนละตัว";
-    case MASSMORE_MAX3010X_ERR_NO_DATA:
-      return "ยังไม่มีข้อมูลใหม่ใน FIFO";
-    case MASSMORE_MAX3010X_ERR_BAD_ARG:
-      return "พารามิเตอร์ที่ส่งมาไม่ถูกต้อง";
-    case MASSMORE_MAX3010X_ERR_UNSUPPORTED:
-      return "ชิปรุ่นที่ต่ออยู่ไม่มีความสามารถนี้";
-    default:
-      return "ข้อผิดพลาดที่ไม่รู้จัก";
+    case ErrorCode::OK: return "OK";
+    case ErrorCode::NOT_FOUND: return "NOT_FOUND";
+    case ErrorCode::WRONG_ID: return "WRONG_ID";
+    case ErrorCode::TIMEOUT: return "TIMEOUT";
+    case ErrorCode::BUS_ERROR: return "BUS_ERROR";
+    case ErrorCode::NOT_READY: return "NOT_READY";
+    case ErrorCode::NOT_BEGUN: return "NOT_BEGUN";
+    case ErrorCode::BAD_ARG: return "BAD_ARG";
+    case ErrorCode::UNSUPPORTED: return "UNSUPPORTED";
+    default: return "UNKNOWN";
   }
 }
 
-const char *MassmoreMAX3010x::lastErrorString() const {
-  return errorToString(_lastError);
+/* =========================================================================
+   BeatDetector
+   ========================================================================= */
+
+Massmore_MAX3010x::BeatDetector::BeatDetector() {
+  _fingerThreshold = MASSMORE_MAX3010X_FINGER_THRESHOLD;
+  _minBpm = 30.0f;
+  _maxBpm = 220.0f;
+  begin(50.0f);
+}
+
+void Massmore_MAX3010x::BeatDetector::begin(float sampleRateHz) {
+  if (sampleRateHz < 10.0f) sampleRateHz = 10.0f;
+  _sampleRate = sampleRateHz;
+  /* one-pole filter: alpha = 1 - exp(-2*pi*fc/fs) */
+  _dcAlpha = 1.0f - expf(-MAX3010X_TWO_PI * MAX3010X_ALGO_HIGHPASS_HZ / _sampleRate);
+  _lpAlpha = 1.0f - expf(-MAX3010X_TWO_PI * MAX3010X_ALGO_LOWPASS_HZ / _sampleRate);
+  _envelopeDecay = 1.0f / (2.0f * _sampleRate); /* envelope คลายตัวใน ~2 s */
+  _warmupSamples = (uint32_t)(_sampleRate * 1.0f);
+  reset();
+}
+
+void Massmore_MAX3010x::BeatDetector::reset() {
+  _dc = _filtered = _envelopeHigh = _envelopeLow = 0.0f;
+  _aboveThreshold = false;
+  _primed = false;
+  _sampleIndex = _lastBeatIndex = 0;
+  _bpm = _bpmAverage = 0.0f;
+  _bpmHistoryCount = _bpmHistoryIndex = 0;
+  _beatCount = 0;
+  for (uint8_t i = 0; i < MASSMORE_MAX3010X_BPM_AVERAGE_COUNT; i++) _bpmHistory[i] = 0.0f;
+}
+
+void Massmore_MAX3010x::BeatDetector::setBpmRange(float minBpm, float maxBpm) {
+  if (minBpm < 20.0f) minBpm = 20.0f;
+  if (maxBpm > 300.0f) maxBpm = 300.0f;
+  if (maxBpm <= minBpm) return;
+  _minBpm = minBpm;
+  _maxBpm = maxBpm;
+}
+
+bool Massmore_MAX3010x::BeatDetector::check(uint32_t sample) {
+  const float value = (float)sample;
+  _sampleIndex++;
+  if (_sampleIndex == 1) {
+    _dc = value; /* seed filter ด้วยค่าแรก จะได้ไม่ต้องไต่จากศูนย์ */
+    _filtered = _envelopeHigh = _envelopeLow = 0.0f;
+    return false;
+  }
+  _dc += (value - _dc) * _dcAlpha;          /* high-pass: ตัด DC */
+  const float ac = value - _dc;
+  _filtered += (ac - _filtered) * _lpAlpha; /* low-pass: ตัด noise */
+
+  if (_filtered > _envelopeHigh) _envelopeHigh = _filtered;
+  else _envelopeHigh -= (_envelopeHigh - _envelopeLow) * _envelopeDecay;
+  if (_filtered < _envelopeLow) _envelopeLow = _filtered;
+  else _envelopeLow += (_envelopeHigh - _envelopeLow) * _envelopeDecay;
+
+  if (_sampleIndex < _warmupSamples) return false;
+  _primed = true;
+
+  if (!isFingerPresent()) {
+    _aboveThreshold = false;
+    return false;
+  }
+  const float amplitude = _envelopeHigh - _envelopeLow;
+  if (amplitude < MAX3010X_ALGO_MIN_AMPLITUDE) {
+    _aboveThreshold = false;
+    return false;
+  }
+  const float riseLevel = _envelopeLow + amplitude * MAX3010X_ALGO_THRESHOLD_RISE;
+  const float fallLevel = _envelopeLow + amplitude * MAX3010X_ALGO_THRESHOLD_FALL;
+
+  if (!_aboveThreshold && _filtered > riseLevel) {
+    _aboveThreshold = true;
+    const uint32_t delta = _sampleIndex - _lastBeatIndex;
+    const uint32_t refractory = (uint32_t)(_sampleRate * 60.0f / _maxBpm);
+    if (_lastBeatIndex != 0 && delta >= refractory) {
+      const float bpm = 60.0f * _sampleRate / (float)delta;
+      if (bpm >= _minBpm && bpm <= _maxBpm) {
+        _bpm = bpm;
+        _bpmHistory[_bpmHistoryIndex] = bpm;
+        _bpmHistoryIndex = (uint8_t)((_bpmHistoryIndex + 1) % MASSMORE_MAX3010X_BPM_AVERAGE_COUNT);
+        if (_bpmHistoryCount < MASSMORE_MAX3010X_BPM_AVERAGE_COUNT) _bpmHistoryCount++;
+        float sum = 0.0f;
+        for (uint8_t i = 0; i < _bpmHistoryCount; i++) sum += _bpmHistory[i];
+        _bpmAverage = sum / (float)_bpmHistoryCount;
+        _beatCount++;
+        _lastBeatIndex = _sampleIndex;
+        return true;
+      }
+    }
+    _lastBeatIndex = _sampleIndex;
+    return false;
+  }
+  if (_aboveThreshold && _filtered < fallLevel) _aboveThreshold = false;
+  return false;
+}
+
+/* =========================================================================
+   Oximeter (streaming ratio-of-ratios)
+   ========================================================================= */
+
+Massmore_MAX3010x::Oximeter::Oximeter() {
+  _calA = -45.060f;
+  _calB = 30.354f;
+  _calC = 94.845f;
+  _fingerThreshold = MASSMORE_MAX3010X_FINGER_THRESHOLD;
+  begin(50.0f, 25);
+}
+
+void Massmore_MAX3010x::Oximeter::begin(float sampleRateHz, uint16_t updateEverySamples) {
+  if (sampleRateHz < 10.0f) sampleRateHz = 10.0f;
+  _sampleRate = sampleRateHz;
+  _updateEvery = (updateEverySamples == 0) ? 1 : updateEverySamples;
+  _dcAlpha = 1.0f - expf(-MAX3010X_TWO_PI * MAX3010X_ALGO_HIGHPASS_HZ / _sampleRate);
+  _lpAlpha = 1.0f - expf(-MAX3010X_TWO_PI * MAX3010X_ALGO_LOWPASS_HZ / _sampleRate);
+  _rmsAlpha = 1.0f - expf(-MAX3010X_TWO_PI * MAX3010X_ALGO_RMS_HZ / _sampleRate);
+  _warmupSamples = (uint32_t)(_sampleRate * 4.0f); /* 4 s ให้ RMS average เข้าที่ */
+  _beat.begin(sampleRateHz);
+  _beat.setFingerThreshold(_fingerThreshold);
+  reset();
+}
+
+void Massmore_MAX3010x::Oximeter::reset() {
+  _dcRed = _dcIr = _lpRed = _lpIr = _msRed = _msIr = 0.0f;
+  _samples = 0;
+  _sinceUpdate = 0;
+  _beat.reset();
+  _result.spo2 = _result.heartRate = _result.ratio = 0.0f;
+  _result.perfusionIr = _result.perfusionRed = _result.dcIr = _result.dcRed = 0.0f;
+  _result.spo2Valid = _result.heartRateValid = _result.fingerPresent = false;
+}
+
+void Massmore_MAX3010x::Oximeter::setCalibration(float a, float b, float c) {
+  _calA = a;
+  _calB = b;
+  _calC = c;
+}
+
+void Massmore_MAX3010x::Oximeter::setFingerThreshold(uint32_t threshold) {
+  _fingerThreshold = threshold;
+  _beat.setFingerThreshold(threshold);
+}
+
+float Massmore_MAX3010x::Oximeter::getFillRatio() const {
+  if (_warmupSamples == 0) return 1.0f;
+  return (_samples >= _warmupSamples) ? 1.0f : (float)_samples / (float)_warmupSamples;
+}
+
+bool Massmore_MAX3010x::Oximeter::add(uint32_t red, uint32_t ir) {
+  const float r = (float)red, i = (float)ir;
+  _samples++;
+  if (_samples == 1) {
+    _dcRed = r;
+    _dcIr = i;
+  } else {
+    _dcRed += (r - _dcRed) * _dcAlpha;
+    _dcIr += (i - _dcIr) * _dcAlpha;
+    _lpRed += ((r - _dcRed) - _lpRed) * _lpAlpha;
+    _lpIr += ((i - _dcIr) - _lpIr) * _lpAlpha;
+    _msRed += (_lpRed * _lpRed - _msRed) * _rmsAlpha; /* mean-square = RMS^2 */
+    _msIr += (_lpIr * _lpIr - _msIr) * _rmsAlpha;
+  }
+  _beat.check(ir);
+
+  _sinceUpdate++;
+  if (_samples < _warmupSamples) return false;
+  if (_sinceUpdate < _updateEvery) return false;
+  _sinceUpdate = 0;
+  compute();
+  return true;
+}
+
+void Massmore_MAX3010x::Oximeter::compute() {
+  const float dcRed = _dcRed, dcIr = _dcIr;
+  const float acRed = sqrtf(_msRed > 0.0f ? _msRed : 0.0f);
+  const float acIr = sqrtf(_msIr > 0.0f ? _msIr : 0.0f);
+
+  _result.dcRed = dcRed;
+  _result.dcIr = dcIr;
+  _result.fingerPresent = (dcIr >= (float)_fingerThreshold);
+
+  /* RMS → peak-to-peak โดยประมาณ (x 2*sqrt(2)) เพื่อให้ Perfusion Index เป็นหน่วยสากล */
+  const float ppRed = acRed * 2.828427f, ppIr = acIr * 2.828427f;
+  _result.perfusionRed = (dcRed > 1.0f) ? (ppRed / dcRed * 100.0f) : 0.0f;
+  _result.perfusionIr = (dcIr > 1.0f) ? (ppIr / dcIr * 100.0f) : 0.0f;
+
+  _result.heartRate = _beat.getAverageBeatsPerMinute();
+  _result.heartRateValid = _result.fingerPresent && _beat.getBeatCount() >= 3 && _result.heartRate > 0.0f;
+
+  _result.spo2Valid = false;
+  _result.ratio = 0.0f;
+  if (!_result.fingerPresent || dcRed < 1000.0f || dcIr < 1000.0f || acIr < 1.0f) {
+    _result.spo2 = 0.0f;
+    return;
+  }
+  const float ratio = (acRed / dcRed) / (acIr / dcIr);
+  _result.ratio = ratio;
+  if (ratio < 0.3f || ratio > 3.0f) { /* นอกช่วงที่เป็นไปได้ทางสรีรวิทยา */
+    _result.spo2 = 0.0f;
+    return;
+  }
+  if (_result.perfusionIr < 0.05f) { /* ชีพจรจมใน noise */
+    _result.spo2 = 0.0f;
+    return;
+  }
+  float spo2 = _calA * ratio * ratio + _calB * ratio + _calC;
+  if (spo2 > 100.0f) spo2 = 100.0f;
+  if (spo2 < 70.0f) spo2 = 70.0f;
+  _result.spo2 = spo2;
+  _result.spo2Valid = true;
 }

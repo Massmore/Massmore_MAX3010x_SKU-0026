@@ -1,0 +1,19 @@
+# PlatformIO
+PlatformIO/.pio/
+PlatformIO/.vscode/.browse.c_cpp.db*
+PlatformIO/.vscode/c_cpp_properties.json
+PlatformIO/.vscode/launch.json
+PlatformIO/.vscode/ipch/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.claude/
+
+# Build artefacts (except firmware/bin which is intentionally distributed)
+*.elf
+*.map

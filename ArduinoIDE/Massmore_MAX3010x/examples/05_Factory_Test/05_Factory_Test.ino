@@ -1,10 +1,4 @@
 /*
-  PlatformIO entry point — same content as examples/05_Factory_Test/05_Factory_Test.ino
-  คัดลอก example อื่นมาทับไฟล์นี้ได้ (เพิ่ม #include <Arduino.h> ไว้แล้ว)
-*/
-#include <Arduino.h>
-
-/*
   05_Factory_Test — Outgoing QA/QC สำหรับบอร์ด Massmore MAX30102 (SKU-0026)
 
   รันเองทันทีหลังบูต พิมพ์ 'r' + Enter ใน Serial Monitor เพื่อทดสอบซ้ำ

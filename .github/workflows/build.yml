@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sync-check:
+    name: ArduinoIDE and PlatformIO sources are identical
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: diff -r ArduinoIDE/Massmore_MAX3010x/src PlatformIO/lib/Massmore_MAX3010x/src
+
+  platformio:
+    name: PlatformIO (esp32dev, esp32-s3-devkitc-1, nano)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install platformio
+      - run: cd PlatformIO && pio run
+
+  arduino-cli:
+    name: Arduino CLI — all examples (ESP32 core 3.x, AVR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "$PWD/bin" >> $GITHUB_PATH
+      - run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32 arduino:avr
+      - run: |
+          mkdir -p "$HOME/Arduino/libraries"
+          cp -r ArduinoIDE/Massmore_MAX3010x "$HOME/Arduino/libraries/"
+      - run: |
+          status=0
+          for sketch in ArduinoIDE/Massmore_MAX3010x/examples/*/; do
+            for fqbn in esp32:esp32:esp32 esp32:esp32:esp32s3 arduino:avr:nano; do
+              echo "::group::$(basename "$sketch") @ $fqbn"
+              arduino-cli compile --fqbn "$fqbn" --warnings all "$sketch" || status=1
+              echo "::endgroup::"
+            done
+          done
+          exit $status
