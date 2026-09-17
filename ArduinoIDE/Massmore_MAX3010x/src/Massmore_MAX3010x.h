@@ -35,8 +35,8 @@
    ========================================================================= */
 #define MASSMORE_MAX3010X_VERSION_MAJOR 2
 #define MASSMORE_MAX3010X_VERSION_MINOR 0
-#define MASSMORE_MAX3010X_VERSION_PATCH 0
-#define MASSMORE_MAX3010X_VERSION_STRING "2.0.0"
+#define MASSMORE_MAX3010X_VERSION_PATCH 1
+#define MASSMORE_MAX3010X_VERSION_STRING "2.0.1"
 
 /* =========================================================================
    Register map (คัดจาก datasheet MAX30102 Rev 1, MAX30101, MAX30105 โดยตรง)
@@ -126,8 +126,9 @@
 #define MASSMORE_MAX3010X_DATA_MASK 0x0003FFFFUL
 #define MASSMORE_MAX3010X_DATA_MAX 0x0003FFFFUL /**< ADC 18-bit full scale = 262143 */
 
-/* Datasheet timing (MAX30102): temperature conversion ~29 ms typ */
-#define MASSMORE_MAX3010X_TEMP_CONV_MS 29
+/* Die temperature conversion: datasheet ~29 ms typ; วัดบนชิปจริงได้ 26-34 ms
+   ชิปจริงอ่าน TEMP_EN กลับได้ 0 ทันทีหลังเขียน จึงต้องรอตามเวลาแทนการดู bit */
+#define MASSMORE_MAX3010X_TEMP_CONV_MS 40
 
 /* =========================================================================
    Compile-time tuning
@@ -145,6 +146,12 @@
 #endif
 #if MASSMORE_MAX3010X_BUFFER_SIZE < 1 || MASSMORE_MAX3010X_BUFFER_SIZE > 255
 #error "MASSMORE_MAX3010X_BUFFER_SIZE must be 1..255"
+#endif
+
+/** จำนวนครั้งที่ลองใหม่เมื่อ I2C transaction ล้มเหลวชั่วคราว (NACK / bus busy)
+ *  ช่วยให้เสถียรบนบัสที่มีหลายอุปกรณ์หรือสายยาว ตั้ง 0 = ไม่ลองซ้ำ */
+#ifndef MASSMORE_MAX3010X_I2C_RETRIES
+#define MASSMORE_MAX3010X_I2C_RETRIES 2
 #endif
 
 /** ระดับ DC ของ IR channel ที่ถือว่ามีนิ้ววางบน sensor (ขึ้นกับกระแส LED) */
@@ -202,7 +209,8 @@ class Massmore_MAX3010x {
     UNSUPPORTED  /**< ชิปรุ่นที่ต่ออยู่ไม่มีความสามารถนี้ */
   };
 
-  /** @brief รุ่นชิป (ทุกรุ่นคืน PART_ID 0x15 เท่ากัน ไลบรารีเดารุ่นจาก register ที่มีเฉพาะรุ่น) */
+  /** @brief รุ่นชิป — ทุกรุ่นคืน PART_ID 0x15 และแยกจาก register ไม่ได้
+   *  ค่าเริ่มต้นคือ MAX30102; ผู้ใช้ MAX30101 / MAX30105 เรียก setVariant() ก่อน begin() */
   enum class Variant : uint8_t { AUTO = 0, MAX30102, MAX30101, MAX30105 };
 
   /** @brief โหมดการทำงานของชิป (MODE[2:0]) */
@@ -259,11 +267,11 @@ class Massmore_MAX3010x {
   static const uint16_t CHK_PART_ID = 1u << 1;     /**< PART_ID = 0x15 */
   static const uint16_t CHK_REV_ID = 1u << 2;      /**< REV_ID ไม่ใช่ 0x00 / 0xFF */
   static const uint16_t CHK_RESET = 1u << 3;       /**< RESET bit self-clear */
-  static const uint16_t CHK_POR_DEFAULT = 1u << 4; /**< ค่าหลัง reset ตรง datasheet */
+  static const uint16_t CHK_POR_DEFAULT = 1u << 4; /**< ค่าหลัง reset ตรงกับชิปจริง */
   static const uint16_t CHK_RW = 1u << 5;          /**< write/read-back ตรง */
   static const uint16_t CHK_READONLY = 1u << 6;    /**< PART_ID เขียนทับไม่ได้ */
-  static const uint16_t CHK_RESERVED = 1u << 7;    /**< reserved bits อ่านได้ 0 */
-  static const uint16_t CHK_FIFO_PTR = 1u << 8;    /**< FIFO pointer เป็น 5-bit field */
+  static const uint16_t CHK_RESERVED = 1u << 7;    /**< MODE_CONFIG bits 5:4 อ่านได้ 0 */
+  static const uint16_t CHK_FIFO_PTR = 1u << 8;    /**< FIFO_WR_PTR วนรอบภายใน 5 bits ขณะวัด */
   static const uint16_t CHK_TEMP = 1u << 9;        /**< die temperature สมเหตุสมผล */
   static const uint16_t CHK_LED = 1u << 10;        /**< ADC ตอบสนองเมื่อเปิด LED */
   static const uint8_t CHK_COUNT = 11;
@@ -412,7 +420,7 @@ class Massmore_MAX3010x {
 
   /** @brief สั่งเริ่มวัด Die Temperature แบบไม่ Block */
   bool startTemperatureConversion();
-  /** @brief วัดอุณหภูมิเสร็จหรือยัง */
+  /** @brief วัดอุณหภูมิเสร็จหรือยัง (รออย่างน้อย MASSMORE_MAX3010X_TEMP_CONV_MS นับจาก start) */
   bool isTemperatureReady();
   /** @brief อ่านผลอุณหภูมิที่วัดเสร็จแล้ว (NAN เมื่อไม่สำเร็จ) */
   float getTemperatureResult();
@@ -609,11 +617,15 @@ class Massmore_MAX3010x {
   uint32_t _bufGreen[MASSMORE_MAX3010X_BUFFER_SIZE];
   uint32_t _bufMs[MASSMORE_MAX3010X_BUFFER_SIZE];
   uint8_t _head, _tail, _count;
+  uint32_t _tempStartMs;
 
   void pushSample(uint32_t red, uint32_t ir, uint32_t green);
   void recomputeChannels();
   bool detectVariant();
   bool waitForBit(uint8_t reg, uint8_t bitMask, bool wantSet, uint32_t timeoutMs);
+  bool readRegister8Once(uint8_t reg, uint8_t &value);
+  bool writeRegister8Once(uint8_t reg, uint8_t value);
+  bool selectRegister(uint8_t reg);
 };
 
 #endif /* MASSMORE_MAX3010X_H */

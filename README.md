@@ -6,7 +6,7 @@
 
 **Arduino / PlatformIO driver library for the Massmore MAX30102 Pulse Oximeter & Heart-Rate Sensor (SKU-0026)**
 
-![version](https://img.shields.io/badge/version-2.0.0-green)
+![version](https://img.shields.io/badge/version-2.0.1-green)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![esp32](https://img.shields.io/badge/Arduino--ESP32-3.x-teal)
 ![platformio](https://img.shields.io/badge/PlatformIO-pioarduino%2055.03.311-orange)
@@ -25,7 +25,7 @@
 | Item | Spec |
 |---|---|
 | Sensor IC | MAX30102 (Red 660 nm + IR 880 nm, 18-bit ADC, 32-sample FIFO) |
-| Interface | I2C, Fast-mode 400 kHz, address `0x57` (fixed) |
+| Interface | I2C (up to 400 kHz; examples use 100 kHz), address `0x57` (fixed) |
 | Supply | 3.0 – 5.5 V (on-board 3.3 V LDO + 1.8 V LDO for the sensor core) |
 | Logic level | I2C lines tolerate 3.3 V and 5 V (on-board level shifter) |
 | Pull-ups | I2C pull-ups on board |
@@ -42,9 +42,11 @@
 | Chip | PART_ID | LEDs | Status |
 |---|---|---|---|
 | **MAX30102** | 0x15 | Red + IR | **Full support** (chip on SKU-0026) |
-| MAX30101 | 0x15 | Red + IR + 2×Green | Supported (auto-detected) |
-| MAX30105 | 0x15 | Red + IR + Green, proximity | Supported (auto-detected) |
+| MAX30101 | 0x15 | Red + IR + 2×Green | Supported — เรียก `setVariant(Variant::MAX30101)` ก่อน `begin()` |
+| MAX30105 | 0x15 | Red + IR + Green, proximity | Supported — เรียก `setVariant(Variant::MAX30105)` ก่อน `begin()` |
 | MAX30100 | 0x11 | Red + IR | Not supported (different register map) — `begin()` returns `WRONG_ID` |
+
+ทุกรุ่นคืน PART_ID 0x15 และจากการทดสอบบนชิปจริง register เฉพาะรุ่นก็เขียน-อ่านได้หมด จึงแยกรุ่นอัตโนมัติไม่ได้ ไลบรารีใช้ **MAX30102** เป็นค่าเริ่มต้น
 
 ---
 
@@ -69,8 +71,8 @@
 
 | MCU Platform | Tested Core / Toolchain | Bus Remapping Support | Limitations / Notes |
 |---|---|---|---|
-| **ESP32-S3** | Arduino-ESP32 v3.x+ (pioarduino 55.03.311) | Full GPIO Matrix (`Wire` / `Wire1`) | None. Recommended for high-rate data. |
-| **ESP32 (Classic)** | Arduino-ESP32 v3.x+ (pioarduino 55.03.311) | Full GPIO Matrix (`Wire` / `Wire1`) | None. Primary Factory Test target. |
+| **ESP32-S3** | Arduino-ESP32 v3.x+ (pioarduino 55.03.311) — **hardware-tested on Massmore MOMO ESP32-S3** | Full GPIO Matrix (`Wire` / `Wire1`) | MOMO: SDA 14 / SCL 15, Serial ผ่าน USB-UART → ใช้ env `massmore-momo-esp32s3` (USB CDC On Boot = off). |
+| **ESP32 (Classic)** | Arduino-ESP32 v3.x+ (pioarduino 55.03.311) — compile-tested | Full GPIO Matrix (`Wire` / `Wire1`) | None. Primary Factory Test target (SDA 21 / SCL 22). |
 | **AVR — Arduino Nano (ATmega328P)** | Arduino AVR Core | Fixed Hardware Pins (I2C: A4/A5) | 2 KB SRAM / 32 KB Flash. Ring buffer ลดเป็น 8 samples อัตโนมัติ; ใช้ Simple API. 5 V logic — บอร์ดนี้มี level shifter จึงต่อตรงได้ |
 
 RP2040 / STM32 ไม่ได้ทดสอบอย่างเป็นทางการ (ไลบรารีไม่มีโค้ดเฉพาะแพลตฟอร์ม จึงควร compile ผ่าน)
@@ -84,6 +86,7 @@ RP2040 / STM32 ไม่ได้ทดสอบอย่างเป็นท�
 2. **Sketch → Include Library → Add .ZIP Library…** เลือกไฟล์ที่ดาวน์โหลด
 3. เปิดตัวอย่างจาก **File → Examples → Massmore_MAX3010x**
 4. ESP32 ต้องติดตั้ง **esp32 by Espressif Systems v3.x** ใน Boards Manager
+5. บอร์ด **Massmore MOMO ESP32-S3**: เลือก board **ESP32S3 Dev Module**, ตั้ง **USB CDC On Boot = Disabled** (Serial ออกทางชิป USB-UART) และ Flash Size = 16MB
 
 ### PlatformIO
 เปิดโฟลเดอร์ [`PlatformIO/`](PlatformIO/) ด้วย VS Code แล้วกด **Build** ได้เลย
@@ -91,8 +94,8 @@ RP2040 / STM32 ไม่ได้ทดสอบอย่างเป็นท�
 
 ```bash
 cd PlatformIO
-pio run -e esp32dev              # หรือ esp32-s3-devkitc-1 / nano
-pio run -e esp32dev -t upload -t monitor
+pio run -e esp32dev                          # หรือ esp32-s3-devkitc-1 / massmore-momo-esp32s3 / nano
+pio run -e massmore-momo-esp32s3 -t upload -t monitor
 ```
 
 `src/main.cpp` คือ `05_Factory_Test` — คัดลอก example อื่นมาทับได้ (เพิ่ม `#include <Arduino.h>` บรรทัดแรก)
@@ -109,8 +112,8 @@ Massmore_MAX3010x sensor;
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(21, 22);          // ESP32: sketch เป็นเจ้าของ I2C Bus (AVR: Wire.begin())
-  Wire.setClock(400000);
+  Wire.begin(21, 22);          // ESP32 (MOMO S3: 14, 15) — sketch เป็นเจ้าของ I2C Bus (AVR: Wire.begin())
+  Wire.setClock(100000);        // 100 kHz เสถียรที่สุด (ชิปรองรับถึง 400 kHz)
 
   if (!sensor.begin(Wire)) {   // ตรวจ PART_ID = 0x15 + soft-reset
     Serial.println(sensor.lastErrorString());
@@ -134,20 +137,21 @@ void loop() {
 **ESP32 (Classic) — Core 3.x custom GPIO**
 ```cpp
 Wire.begin(21, 22);             // SDA, SCL (Qwiic default)
-Wire1.begin(33, 32, 400000);    // I2C Bus ตัวที่สอง ย้ายขาได้อิสระ
+Wire1.begin(33, 32, 100000);    // I2C Bus ตัวที่สอง ย้ายขาได้อิสระ
 sensor.begin(Wire1);
 ```
 
-**ESP32-S3 — custom GPIO**
+**ESP32-S3 (Massmore MOMO) — custom GPIO**
 ```cpp
-Wire.begin(8, 9);               // SDA, SCL
+Wire.begin(14, 15);             // SDA, SCL ของบอร์ด MOMO
+Wire.setClock(100000);
 sensor.begin(Wire);
 ```
 
 **Arduino Nano — fixed hardware pins**
 ```cpp
 Wire.begin();                   // SDA = A4, SCL = A5 (ย้ายไม่ได้)
-Wire.setClock(400000);
+Wire.setClock(100000);        // 100 kHz เสถียรที่สุด (ชิปรองรับถึง 400 kHz)
 sensor.begin(Wire);
 ```
 
@@ -176,6 +180,7 @@ sensor.begin(Wire);
 | `isGenuine()` / `verifyChip()` | ตรวจของแท้ 11 ข้อ (reset ชิป ต้อง `setup()` ใหม่) | `bool` / `Genuine` |
 | `getVariantName()`, `readRevisionID()` | ชื่อรุ่น (MAX30102/30101/30105), REV_ID | `const char*` / `uint8_t` |
 | `getEffectiveSampleRate()` | อัตราข้อมูลจริง = rate ÷ average (Hz) | `float` |
+| `setVariant(Variant)` | ระบุรุ่นชิป (ค่าเริ่มต้น MAX30102) — เรียกก่อน `begin()` | `void` |
 | `lastError()` / `lastErrorString()` | `ErrorCode` ล่าสุด: `OK, NOT_FOUND, WRONG_ID, TIMEOUT, BUS_ERROR, NOT_READY, NOT_BEGUN, BAD_ARG, UNSUPPORTED` | `ErrorCode` / `const char*` |
 | `readRegister8()`, `writeRegister8()`, `maskRegister8()`, `readRegisterBurst()` | เข้าถึง register ตรง | `bool` |
 

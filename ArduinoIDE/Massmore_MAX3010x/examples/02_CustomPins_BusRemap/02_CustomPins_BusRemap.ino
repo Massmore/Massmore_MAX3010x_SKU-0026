@@ -8,9 +8,9 @@
   Arduino Nano (ATmega328P) มี I2C hardware ชุดเดียว ขาตายตัว A4 = SDA, A5 = SCL
   ย้ายขาไม่ได้ ตัวอย่างนี้จึง fallback ไปใช้ Wire ปกติให้
 
-  Wiring ESP32 (Classic)         Wiring ESP32-S3
-    SDA -> GPIO 33                 SDA -> GPIO 8
-    SCL -> GPIO 32                 SCL -> GPIO 9
+  Wiring ESP32 (Classic)         Wiring ESP32-S3 (Massmore MOMO)
+    SDA -> GPIO 33                 SDA -> GPIO 14
+    SCL -> GPIO 32                 SCL -> GPIO 15
 
   Designed and Manufactured by Massmore | MIT License
 */
@@ -19,8 +19,8 @@
 #include <Massmore_MAX3010x.h>
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-#define PIN_SDA 8
-#define PIN_SCL 9
+#define PIN_SDA 14 /* Massmore MOMO ESP32-S3 */
+#define PIN_SCL 15
 #define I2C_BUS Wire1
 #elif defined(ESP32)
 #define PIN_SDA 33
@@ -41,14 +41,14 @@ void setup() {
 
 #if defined(ESP32)
   /* Core 3.x: Wire1.begin(sda, scl[, frequency]) */
-  I2C_BUS.begin(PIN_SDA, PIN_SCL, 400000);
+  I2C_BUS.begin(PIN_SDA, PIN_SCL, 100000); /* 100 kHz */
   Serial.print(F("Using Wire1 on SDA="));
   Serial.print(PIN_SDA);
   Serial.print(F(" SCL="));
   Serial.println(PIN_SCL);
 #else
   I2C_BUS.begin();
-  I2C_BUS.setClock(400000);
+  I2C_BUS.setClock(100000); /* 100 kHz: เสถียรบนบัสที่มีหลายอุปกรณ์ */
   Serial.println(F("AVR: using Wire on fixed pins SDA=A4 SCL=A5"));
 #endif
 

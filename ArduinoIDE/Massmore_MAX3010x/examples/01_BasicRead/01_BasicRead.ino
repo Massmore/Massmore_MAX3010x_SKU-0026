@@ -9,6 +9,7 @@
   ค่าที่เห็นคือ ADC 18-bit (0-262143) ยังไม่มีนิ้ว = หลักร้อย-พัน, วางนิ้ว = หลักหมื่น-แสน
   แล้วแกว่งเบา ๆ ตามชีพจร
 
+  Wiring (Massmore MOMO ESP32-S3): SDA -> GPIO 14, SCL -> GPIO 15
   Wiring (Classic ESP32 / Qwiic)      Wiring (Arduino Nano)
     VIN -> 3V3        SDA -> GPIO 21    VIN -> 5V    SDA -> A4
     GND -> GND        SCL -> GPIO 22    GND -> GND   SCL -> A5
@@ -19,7 +20,10 @@
 #include <Wire.h>
 #include <Massmore_MAX3010x.h>
 
-#if defined(ESP32)
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define PIN_SDA 14 /* Massmore MOMO ESP32-S3 */
+#define PIN_SCL 15
+#elif defined(ESP32)
 #define PIN_SDA 21
 #define PIN_SCL 22
 #endif
@@ -38,7 +42,7 @@ void setup() {
 #else
   Wire.begin(); /* AVR: SDA = A4, SCL = A5 (fixed hardware pins) */
 #endif
-  Wire.setClock(400000); /* MAX3010x รองรับ Fast-mode 400 kHz */
+  Wire.setClock(100000); /* 100 kHz เสถียรที่สุดเมื่อมีหลายอุปกรณ์บนบัส (ชิปรองรับถึง 400 kHz) */
 
   if (!sensor.begin(Wire)) {
     Serial.print(F("Sensor not found: "));

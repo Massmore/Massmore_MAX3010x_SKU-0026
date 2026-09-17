@@ -9,6 +9,7 @@
 
   ถ้า LED กระพริบสม่ำเสมอ = loop() ไม่ถูก block จริง
 
+  Wiring (Massmore MOMO ESP32-S3): SDA -> GPIO 14, SCL -> GPIO 15
   Wiring (Classic ESP32)              Wiring (Arduino Nano)
     VIN -> 3V3   SDA -> GPIO 21        VIN -> 5V   SDA -> A4
     GND -> GND   SCL -> GPIO 22        GND -> GND  SCL -> A5
@@ -19,7 +20,10 @@
 #include <Wire.h>
 #include <Massmore_MAX3010x.h>
 
-#if defined(ESP32)
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define PIN_SDA 14 /* Massmore MOMO ESP32-S3 */
+#define PIN_SCL 15
+#elif defined(ESP32)
 #define PIN_SDA 21
 #define PIN_SCL 22
 #endif
@@ -47,7 +51,7 @@ void setup() {
 #else
   Wire.begin();
 #endif
-  Wire.setClock(400000);
+  Wire.setClock(100000); /* 100 kHz: เสถียรบนบัสที่มีหลายอุปกรณ์ */
 
   if (!sensor.begin(Wire)) {
     Serial.print(F("Sensor not found: "));

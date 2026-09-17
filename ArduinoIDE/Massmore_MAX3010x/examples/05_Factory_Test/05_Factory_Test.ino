@@ -14,6 +14,7 @@
     7. CONTINUOUS     อ่าน 20 samples ต่อเนื่อง ไม่ TIMEOUT ไม่ saturate
     8. INT_PIN        (ถ้าต่อ) ขา INT ต้องดึงต่ำเมื่อ FIFO almost full และปล่อยสูงเมื่ออ่าน status
 
+  Wiring MOMO ESP32-S3: SDA -> GPIO 14, SCL -> GPIO 15, INT ไม่ต่อ (PIN_INT = -1)
   Default wiring (Primary test MCU = Classic ESP32)
     VIN -> 3V3   GND -> GND   SDA -> GPIO 21   SCL -> GPIO 22   INT -> GPIO 4 (optional)
 
@@ -26,9 +27,9 @@
 
 /* ---- Pins are hardcoded ONLY in this sketch ---- */
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-#define PIN_SDA 8
-#define PIN_SCL 9
-#define PIN_INT 4
+#define PIN_SDA 14 /* Massmore MOMO ESP32-S3 */
+#define PIN_SCL 15
+#define PIN_INT -1 /* ต่อขา INT แล้วใส่ GPIO ที่ใช้ */
 #define MCU_NAME "ESP32-S3"
 #elif defined(ESP32)
 #define PIN_SDA 21
@@ -340,7 +341,7 @@ void setup() {
 #else
   Wire.begin();
 #endif
-  Wire.setClock(400000);
+  Wire.setClock(100000); /* 100 kHz: เสถียรบนบัสที่มีหลายอุปกรณ์ */
   runFactoryTest();
 }
 
