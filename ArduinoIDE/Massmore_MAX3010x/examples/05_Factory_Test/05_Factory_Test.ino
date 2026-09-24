@@ -16,7 +16,8 @@
 
   Wiring MOMO ESP32-S3: SDA -> GPIO 14, SCL -> GPIO 15, INT ไม่ต่อ (PIN_INT = -1)
   Default wiring (Primary test MCU = Classic ESP32)
-    VIN -> 3V3   GND -> GND   SDA -> GPIO 21   SCL -> GPIO 22   INT -> GPIO 4 (optional)
+    VIN -> 3V3   GND -> GND   SDA -> GPIO 21   SCL -> GPIO 22
+    INT ไม่ต่อ (PIN_INT = -1) — ถ้าต้องการทดสอบ INT ให้ต่อ INT -> GPIO 4 แล้วตั้ง PIN_INT 4
 
   Designed and Manufactured by Massmore | MIT License
 */
@@ -34,7 +35,7 @@
 #elif defined(ESP32)
 #define PIN_SDA 21
 #define PIN_SCL 22
-#define PIN_INT 4
+#define PIN_INT -1 /* ไม่ต่อ INT ตามค่าเริ่มต้น — ถ้าต่อ INT -> GPIO 4 ให้เปลี่ยนเป็น 4 */
 #define MCU_NAME "ESP32"
 #elif defined(__AVR__)
 #define PIN_INT 2 /* Nano: A4/A5 fixed for I2C */
@@ -53,6 +54,17 @@ Massmore_MAX3010x sensor;
 
 static bool g_pass = true;
 static const char *g_reason = "";
+
+/* ประกาศ struct ก่อนฟังก์ชันแรกเสมอ — Arduino IDE สร้าง function prototype อัตโนมัติ
+   แล้วแทรกไว้ก่อนฟังก์ชันแรกของไฟล์ ถ้า struct อยู่ใต้จุดนั้นจะ compile error
+   "variable or field 'capture' declared void" */
+/* เก็บสถิติจาก N samples (Blocking readAll ทีละตัว) */
+struct Stats {
+  uint32_t count, timeouts, saturated;
+  uint32_t minIr, maxIr, minRed, maxRed;
+  uint32_t sumIr, sumRed; /* 20 x 262143 < 2^32 */
+  uint32_t elapsedMs;
+};
 
 /* -------------------------------------------------------------------------
    Helpers
@@ -99,14 +111,6 @@ static void fail(const char *reason) {
     g_reason = reason;
   }
 }
-
-/* เก็บสถิติจาก N samples (Blocking readAll ทีละตัว) */
-struct Stats {
-  uint32_t count, timeouts, saturated;
-  uint32_t minIr, maxIr, minRed, maxRed;
-  uint32_t sumIr, sumRed; /* 20 x 262143 < 2^32 */
-  uint32_t elapsedMs;
-};
 
 static void capture(Stats &s, uint8_t samples) {
   s.count = s.timeouts = s.saturated = 0;

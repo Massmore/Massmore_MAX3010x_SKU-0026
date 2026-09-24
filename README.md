@@ -72,7 +72,7 @@
 | MCU Platform | Tested Core / Toolchain | Bus Remapping Support | Limitations / Notes |
 |---|---|---|---|
 | **ESP32-S3** | Arduino-ESP32 v3.x+ (pioarduino 55.03.311) — **hardware-tested on Massmore MOMO ESP32-S3** | Full GPIO Matrix (`Wire` / `Wire1`) | MOMO: SDA 14 / SCL 15, Serial ผ่าน USB-UART → ใช้ env `massmore-momo-esp32s3` (USB CDC On Boot = off). |
-| **ESP32 (Classic)** | Arduino-ESP32 v3.x+ (pioarduino 55.03.311) — compile-tested | Full GPIO Matrix (`Wire` / `Wire1`) | None. Primary Factory Test target (SDA 21 / SCL 22). |
+| **ESP32 (Classic)** | Arduino-ESP32 v3.x+ (Core 3.3.11) — **hardware-tested** | Full GPIO Matrix (`Wire` / `Wire1`) | None. Primary Factory Test target (SDA 21 / SCL 22). Pre-built binary อยู่ใน `firmware/bin/`. |
 | **AVR — Arduino Nano (ATmega328P)** | Arduino AVR Core | Fixed Hardware Pins (I2C: A4/A5) | 2 KB SRAM / 32 KB Flash. Ring buffer ลดเป็น 8 samples อัตโนมัติ; ใช้ Simple API. 5 V logic — บอร์ดนี้มี level shifter จึงต่อตรงได้ |
 
 RP2040 / STM32 ไม่ได้ทดสอบอย่างเป็นทางการ (ไลบรารีไม่มีโค้ดเฉพาะแพลตฟอร์ม จึงควร compile ผ่าน)
